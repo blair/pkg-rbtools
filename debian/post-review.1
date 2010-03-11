@@ -1,7 +1,7 @@
 .mso www.tmac
 .TH POST-REVIEW "1" "March 2010" "post-review 0.8" "User Commands"
 .SH NAME
-post-review \- manual page for post-review 0.8
+post-review \- post/update reviews to Review Board
 .SH SYNOPSIS
 .B post-review
 [\fI-pond\fR] [\fI-r review_id\fR] [\fIchangenum\fR]
@@ -125,7 +125,7 @@ changelist
 Specifies the label used for ClearCase.
 
 .SH DESCRIPTION
-.b post-review
+.B post-review
 is intended to post a review from a local repository to the Review Board
 server, or update such an existing review. It works differently with
 different version-control systems. For CVS and Subversion, the review to
@@ -141,7 +141,7 @@ information on using them with this program.
 [A more detaild description can help]
 
 .SH CONFIGURATION
-.b post-review
+.B post-review
 needs to be told of the address of the server to post to. This can come from
 several possible places:
 
@@ -238,7 +238,7 @@ This does not create a new diff. Rather, it updates the existing one.
 In the following two examples, the review was not published.
 
 .SH AUTHOR
-.b post-review was written by Christian Hammond and David Trowbridge.
+.B post-review was written by Christian Hammond and David Trowbridge.
 
 This man page was written by Tzafrir Cohen <tzafrir.cohen@xorcom.com>.
 
