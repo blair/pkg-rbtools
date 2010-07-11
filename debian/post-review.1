@@ -4,7 +4,7 @@
 post-review \- post/update reviews to Review Board
 .SH SYNOPSIS
 .B post-review
-[\fI-pond\fR] [\fI-r review_id\fR] [\fIchangenum\fR]
+[\fI\-pond\fR] [\fI\-r review_id\fR] [\fIchangenum\fR]
 .SH OPTIONS
 .SS Review Request Options
 \fB\-p\fR, \fB\-\-publish\fR
@@ -150,10 +150,10 @@ several possible places:
 For example, the following command will set a repository-specific property:
 
 .EX
-git config --add reviewboard.url http://reviewboard.example.com
+git config \-\-add reviewboard.url http://reviewboard.example.com
 .EE
 
-Refer to git-config(1) for the full details.
+Refer to git\-config(1) for the full details.
 .RE
 
 .B Subversion Property reviewboard:url
@@ -211,7 +211,7 @@ TREES = {
 post a new review from a working subversion copy:
 
 .EX
-post-review
+post\-review
 .EE
 
 This generates a new draft review. Refer to the "Field Defaults" options
@@ -220,15 +220,15 @@ set them later through the web interface.
 
 Update that review, assuming its review number is 17:
 
-  post-review -r 17
+  post\-review \-r 17
 
 To post a review from a your GIT feature branch:
 
 .EX
-git checkout -b new-feature main-branch
-emacs -f butterfly '.......' # or ed
+git checkout \-b new\-feature main\-branch
+emacs \-f butterfly '.......' # or ed
 git commit
-post-review
+post\-review
 .EE
 
 [That said, I can't really follow the documentation as to how post-review
