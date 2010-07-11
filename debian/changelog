@@ -1,5 +1,5 @@
-rbtools (0.2~rc1-1) UNRELEASED; urgency=low
+rbtools (0.2-1) UNRELEASED; urgency=low
 
   * Initial release. (Closes: #XXXXXX)
 
- -- Tzafrir Cohen <tzafrir.cohen@xorcom.com>  Thu, 18 Feb 2010 18:45:10 +0200
+ -- Tzafrir Cohen <tzafrir@debian.org>  Sun, 11 Jul 2010 12:31:24 +0300
