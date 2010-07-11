@@ -1,0 +1,18 @@
+Source: rbtools
+Section: python
+Priority: optional
+Maintainer: Tzafrir Cohen <tzafrir.cohen@xorcom.com>
+#Uploaders: Debian Python Modules Team <python-modules-team@lists.alioth.debian.org>
+Build-Depends: debhelper (>= 7), python (>= 2.5)
+Build-Depends-Indep: python-support (>= 0.5.3), python-setuptools
+Standards-Version: 3.8.4
+Homepage: http://www.reviewboard.org/
+#Vcs-Svn: svn://svn.debian.org/python-modules/packages/dajaxice/trunk/
+#Vcs-Browser: http://svn.debian.org/viewsvn/python-modules/packages/dajaxice/trunk/
+
+Package: python-rbtools
+Architecture: all
+Depends: ${misc:Depends}, ${python:Depends}, python-simplejson
+Description: collection of console utility scripts for use with Review Board
+ collection of console utility scripts for use with the Review Board code
+ review system.

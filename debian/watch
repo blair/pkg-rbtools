@@ -1,0 +1,5 @@
+version=3
+
+# FIXME: Does not produce the latest
+opts="dversionmangle=s/~rc/rc/,uversionmangle=s/rc/~rc/" \
+  http://downloads.reviewboard.org/releases/RBTools/0.2/ RBTools-(.*)\.tar\.gz

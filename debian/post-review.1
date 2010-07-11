@@ -1,0 +1,248 @@
+.mso www.tmac
+.TH POST-REVIEW "1" "March 2010" "post-review 0.8" "User Commands"
+.SH NAME
+post-review \- post/update reviews to Review Board
+.SH SYNOPSIS
+.B post-review
+[\fI-pond\fR] [\fI-r review_id\fR] [\fIchangenum\fR]
+.SH OPTIONS
+.SS Review Request Options
+\fB\-p\fR, \fB\-\-publish\fR
+publish the review request immediately after
+submitting
+.TP
+\fB\-r\fR ID, \fB\-\-review\-request\-id\fR=\fIID\fR
+existing review request ID to update
+.TP
+\fB\-\-revision\-range\fR=\fIREVISION_RANGE\fR
+generate the diff for review based on given revision
+range
+
+.SS Server Options
+\fB\-\-server\fR=\fISERVER\fR
+specify a different Review Board server to use
+.TP
+\fB\-\-submit\-as\fR=\fIUSERNAME\fR
+user name to be recorded as the author of the review
+request, instead of the logged in user
+.TP
+\fB\-\-username\fR=\fIUSERNAME\fR
+user name to be supplied to the reviewboard server
+.TP
+\fB\-\-password\fR=\fIPASSWORD\fR
+password to be supplied to the reviewboard server
+
+.SS Basic Options
+\fB\-\-version\fR
+show program's version number and exit
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+show this help message and exit
+.TP
+\fB\-o\fR, \fB\-\-open\fR
+open a web browser to the review request page
+.TP
+\fB\-n\fR, \fB\-\-output\-diff\fR
+outputs a diff to the console and exits. Does not post
+
+.SS Field Defaults Options
+\fB\-\-target\-groups\fR=\fITARGET_GROUPS\fR
+names of the groups who will perform the review
+.TP
+\fB\-\-target\-people\fR=\fITARGET_PEOPLE\fR
+names of the people who will perform the review
+.TP
+\fB\-\-summary\fR=\fISUMMARY\fR
+summary of the review
+.TP
+\fB\-\-description\fR=\fIDESCRIPTION\fR
+description of the review
+.TP
+\fB\-\-description\-file\fR=\fIDESCRIPTION_FILE\fR
+text file containing a description of the review
+.TP
+\fB\-\-testing\-done\fR=\fITESTING_DONE\fR
+details of testing done
+.TP
+\fB\-\-testing\-done\-file\fR=\fITESTING_FILE\fR
+text file containing details of testing done
+.TP
+\fB\-\-branch\fR=\fIBRANCH\fR
+affected branch
+.TP
+\fB\-\-bugs\-closed\fR=\fIBUGS_CLOSED\fR
+list of bugs closed
+.TP
+\fB\-\-change\-only\fR
+updates info from changelist, but does not upload a
+new diff (only available if your repository supports
+changesets)
+.TP
+\fB\-\-tracking\-branch\fR=\fITRACKING\fR
+Tracking branch from which your branch is derived (git
+only, defaults to origin/master)
+.TP
+\fB\-\-p4\-client\fR=\fIP4_CLIENT\fR
+the Perforce client name that the review is in
+.TP
+\fB\-\-p4\-port\fR=\fIP4_PORT\fR
+the Perforce servers IP address that the review is on
+.TP
+\fB\-d\fR, \fB\-\-debug\fR
+display debug output
+.TP
+\fB\-\-diff\-filename\fR=\fIDIFF_FILENAME\fR
+upload an existing diff file, instead of generating a
+new diff
+.SS Git Options
+\fB\-\-guess\-summary\fR
+guess summary from the latest commit (git/hgsubversion
+only)
+.TP
+\fB\-\-guess\-description\fR
+guess description based on commits on this branch
+(git/hgsubversion only)
+
+.SS Git and Mercurial Options
+\fB\-\-parent\fR=\fIPARENT_BRANCH\fR
+the parent branch this diff should be against (only
+available if your repository supports parent diffs)
+
+.SS Subversion Options
+\fB\-\-repository\-url\fR=\fIREPOSITORY_URL\fR
+the url for a repository for creating a diff outside
+of a working copy (currently only supported by
+Subversion). Requires either \fB\-\-revision\-rangeor\fR
+\fB\-\-diff\-filename\fR options
+
+.SS Perforce Options
+\fB\-\-diff\-only\fR
+uploads a new diff, but does not update info from
+changelist
+
+.SS ClearCase Options
+\fB\-\-label\fR=\fILABEL\fR
+Specifies the label used for ClearCase.
+
+.SH DESCRIPTION
+.B post-review
+is intended to post a review from a local repository to the Review Board
+server, or update such an existing review. It works differently with
+different version-control systems. For CVS and Subversion, the review to
+post is the uncommited change in a working copy. With distributed VC
+systems (currently Git and Mercurial are supported), the review is a
+topic branch. Posting it is, technically, pushing it to the repository
+at the Review Board server.
+
+PerForce and ClearCase also seem to be supported but the author of this
+page fails to understand the details. Refer to undocumented(7) for more
+information on using them with this program.
+
+[A more detaild description can help]
+
+.SH CONFIGURATION
+.B post-review
+needs to be told of the address of the server to post to. This can come from
+several possible places:
+
+.B GIT property reviewboard.url
+.RS
+For example, the following command will set a repository-specific property:
+
+.EX
+git config --add reviewboard.url http://reviewboard.example.com
+.EE
+
+Refer to git-config(1) for the full details.
+.RE
+
+.B Subversion Property reviewboard:url
+.RS
+The subversion property reviewboard:url may be set on the top-level
+directory.
+
+.EX
+svn propset reviewboard:url http://reviewboard.example.com .
+.EE
+
+.RE
+
+.B Perforce Counters
+.RS
+Rumour has it they exist and can even help in the configuration here.
+.RE
+
+.B .reviewboardrc
+
+.B $HOME/.reviewboardrc
+.RS
+The file .reviewboardrc can exist in either the top-level directory of
+the project or under the user's top-level directory. This file uses python
+syntax for assignments. It has two optionalmethods of defining the
+repository URL:
+
+.B REVIEWBOARD_URL
+.RS
+A simple variable pointing to the server:
+
+.EX
+REVIEWBOARD_URL = "http://reviewboard.example.com"
+.EE
+.RE
+
+.B TREES
+.RS
+A directionary of subversion repositories to REVIEWBOARD_URL-s:
+
+.EX
+TREES = {
+    'http://svn.example.com': {
+        'REVIEWBOARD_URL': 'http://rb.example.com',
+    },
+    'username@cvs.example.com:/cvsroot/cvs': {
+        'REVIEWBOARD_URL': 'http://rb.example.com',
+    },
+}
+
+.EE
+.RE
+
+.SH EXAMPLES
+post a new review from a working subversion copy:
+
+.EX
+post-review
+.EE
+
+This generates a new draft review. Refer to the "Field Defaults" options
+above to set non-empty values to some fields in the review. Alternatively
+set them later through the web interface.
+
+Update that review, assuming its review number is 17:
+
+  post-review -r 17
+
+To post a review from a your GIT feature branch:
+
+.EX
+git checkout -b new-feature main-branch
+emacs -f butterfly '.......' # or ed
+git commit
+post-review
+.EE
+
+[That said, I can't really follow the documentation as to how post-review
+works on git/hg: how does it post the last diff only?]
+
+This does not create a new diff. Rather, it updates the existing one.
+In the following two examples, the review was not published.
+
+.SH AUTHOR
+.B post-review was written by Christian Hammond and David Trowbridge.
+
+This man page was written by Tzafrir Cohen <tzafrir.cohen@xorcom.com>.
+
+.SH SEE ALSO
+
+.URL "http://www.reviewboard.org/docs/manual/dev/users/tools/post-review/" "On-Line Documentation"
+
