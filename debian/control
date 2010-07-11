@@ -1,7 +1,7 @@
 Source: rbtools
 Section: python
 Priority: optional
-Maintainer: Tzafrir Cohen <tzafrir.cohen@xorcom.com>
+Maintainer: Tzafrir Cohen <tzafrir@debian.org>
 #Uploaders: Debian Python Modules Team <python-modules-team@lists.alioth.debian.org>
 Build-Depends: debhelper (>= 7), python (>= 2.5)
 Build-Depends-Indep: python-support (>= 0.5.3), python-setuptools
