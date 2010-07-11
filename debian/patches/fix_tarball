@@ -1,0 +1,73 @@
+Description: Fix missing files in the tarball
+ Some files that are missing from the tarball, but are included in
+ the upstream release-0.2 branch.
+Author: Christian Hammond <chipx86@chipx86.com>
+
+---
+
+--- /dev/null
++++ rbtools-0.2/INSTALL
+@@ -0,0 +1,11 @@
++Installation
++============
++
++To install rbtools, simply run the following as root:
++
++    $ python setup.py install
++
++
++Or to automatically download and install the latest version, you can run:
++
++    $ easy_install -U RBTools
+--- rbtools-0.2.orig/setup.cfg
++++ rbtools-0.2/setup.cfg
+@@ -1,16 +1,14 @@
+ [egg_info]
+-tag_build = 
+-tag_date = 0
+-tag_svn_revision = 0
++tag_build = .dev
++tag_svn_revision = 1
+ 
+ [aliases]
++snapshot = egg_info -Dr
++nightly = egg_info -dR
+ alpha2 = egg_info -DRb alpha2
+ alpha1 = egg_info -DRb alpha1
+-rc1 = egg_info -DRb rc1
+-rc2 = egg_info -DRb rc2
+-nightly = egg_info -dR
+-snapshot = egg_info -Dr
+ beta2 = egg_info -DRb beta2
+ beta1 = egg_info -DRb beta1
++rc1 = egg_info -DRb rc1
++rc2 = egg_info -DRb rc2
+ release = egg_info -DRb ''
+-
+--- /dev/null
++++ rbtools-0.2/.reviewboardrc
+@@ -0,0 +1 @@
++REVIEWBOARD_URL = "http://reviews.reviewboard.org"
+--- /dev/null
++++ rbtools-0.2/COPYING
+@@ -0,0 +1,20 @@
++Copyright (c) 2007-2010  Christian Hammond
++Copyright (c) 2007-2010  David Trowbridge
++
++Permission is hereby granted, free of charge, to any person obtaining a copy of
++this software and associated documentation files (the "Software"), to deal in
++the Software without restriction, including without limitation the rights to
++use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
++of the Software, and to permit persons to whom the Software is furnished to do
++so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
