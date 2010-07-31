@@ -13,8 +13,8 @@ Package: python-rbtools
 Architecture: all
 Depends: ${misc:Depends}, ${python:Depends}, python (>= 2.6) | python-simplejson, python-pkg-resources
 Provides: ${python:Provides}
-Description: collection of console utility scripts for use with Review Board
- collection of console utility scripts for use with the Review Board code
+Description: command-line client-side script for Review Board
+ collection of command-line tools for use with the Review Board code
  review system.
  .
  At the moment it only includes the script post-review, which is intended for
