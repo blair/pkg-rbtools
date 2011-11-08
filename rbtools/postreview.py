@@ -1,10 +1,9 @@
 #!/usr/bin/env python
+import base64
 import cookielib
-import difflib
 import getpass
 import marshal
 import mimetools
-import ntpath
 import os
 import re
 import socket
@@ -14,7 +13,9 @@ import sys
 import tempfile
 import urllib
 import urllib2
+from datetime import datetime
 from optparse import OptionParser
+from pkg_resources import parse_version
 from tempfile import mkstemp
 from urlparse import urljoin, urlparse
 
@@ -25,9 +26,11 @@ except ImportError:
     from md5 import md5
 
 try:
-    import json
+    # Specifically import json_loads, to work around some issues with
+    # installations containing incompatible modules named "json".
+    from json import loads as json_loads
 except ImportError:
-    import simplejson as json
+    from simplejson import loads as json_loads
 
 # This specific import is necessary to handle the paths for
 # cygwin enabled machines.
@@ -111,6 +114,7 @@ DEBUG           = False
 user_config = None
 tempfiles = []
 options = None
+configs = []
 
 ADD_REPOSITORY_DOCS_URL = \
     'http://www.reviewboard.org/docs/manual/dev/admin/management/repositories/'
@@ -134,6 +138,15 @@ class APIError(Exception):
             return '%s (%s)' % (self.rsp['err']['msg'], code_str)
         else:
             return code_str
+
+
+class HTTPRequest(urllib2.Request):
+    def __init__(self, url, body='', headers={}, method="PUT"):
+        urllib2.Request.__init__(self, url, body, headers)
+        self.method = method
+
+    def get_method(self):
+        return self.method
 
 
 class RepositoryInfo:
@@ -229,7 +242,7 @@ class SvnRepositoryInfo(RepositoryInfo):
 
         # If one of the directories doesn't match, then path is not relative
         # to root.
-        if rootdirs != pathdirs:
+        if rootdirs != pathdirs[:len(rootdirs)]:
             return None
 
         # All the directories matched, so the relative path is whatever
@@ -238,7 +251,7 @@ class SvnRepositoryInfo(RepositoryInfo):
         if len(pathdirs) == len(rootdirs):
             return '/'
         else:
-            return '/'.join(pathdirs[len(rootdirs):])
+            return '/' + '/'.join(pathdirs[len(rootdirs):])
 
     def _split_on_slash(self, path):
         # Split on slashes, but ignore multiple slashes and throw away any
@@ -247,6 +260,168 @@ class SvnRepositoryInfo(RepositoryInfo):
         if split[-1] == '':
             split = split[0:-1]
         return split
+
+class ClearCaseRepositoryInfo(RepositoryInfo):
+    """
+    A representation of a ClearCase source code repository. This version knows
+    how to find a matching repository on the server even if the URLs differ.
+    """
+
+    def __init__(self, path, base_path, vobstag, supports_parent_diffs=False):
+        RepositoryInfo.__init__(self, path, base_path,
+                                supports_parent_diffs=supports_parent_diffs)
+        self.vobstag = vobstag
+
+    def find_server_repository_info(self, server):
+        """
+        The point of this function is to find a repository on the server that
+        matches self, even if the paths aren't the same. (For example, if self
+        uses an 'http' path, but the server uses a 'file' path for the same
+        repository.) It does this by comparing VOB's name. If the
+        repositories use the same path, you'll get back self, otherwise you'll
+        get a different ClearCaseRepositoryInfo object (with a different path).
+        """
+
+        # Find VOB's family uuid based on VOB's tag
+        uuid = self._get_vobs_uuid(self.vobstag)
+        debug("Repositorie's %s uuid is %r" % (self.vobstag, uuid))
+
+        repositories = server.get_repositories()
+        for repository in repositories:
+            if repository['tool'] != 'ClearCase':
+                continue
+
+            info = self._get_repository_info(server, repository)
+
+            if not info or uuid != info['uuid']:
+                continue
+
+            debug('Matching repository uuid:%s with path:%s' %(uuid,
+                  info['repopath']))
+            return ClearCaseRepositoryInfo(info['repopath'],
+                    info['repopath'], uuid)
+
+        # We didn't found uuid but if version is >= 1.5.3
+        # we can try to use VOB's name hoping it is better
+        # than current VOB's path.
+        if server.rb_version >= '1.5.3':
+            self.path = cpath.split(self.vobstag)[1]
+
+        # We didn't find a matching repository on the server.
+        # We'll just return self and hope for the best.
+        return self
+
+    def _get_vobs_uuid(self, vobstag):
+        """Return family uuid of VOB."""
+
+        property_lines = execute(["cleartool", "lsvob", "-long", vobstag],
+                                 split_lines=True)
+        for line  in property_lines:
+            if line.startswith('Vob family uuid:'):
+                return  line.split(' ')[-1].rstrip()
+
+    def _get_repository_info(self, server, repository):
+        try:
+            return server.get_repository_info(repository['id'])
+        except APIError, e:
+            # If the server couldn't fetch the repository info, it will return
+            # code 210. Ignore those.
+            # Other more serious errors should still be raised, though.
+            if e.error_code == 210:
+                return None
+
+            raise e
+
+
+class PresetHTTPAuthHandler(urllib2.BaseHandler):
+    """urllib2 handler that conditionally presets the use of HTTP Basic Auth.
+
+    This is used when specifying --username= on the command line. It will
+    force an HTTP_AUTHORIZATION header with the user info, asking the user
+    for any missing info beforehand. It will then try this header for that
+    first request.
+
+    It will only do this once.
+    """
+    handler_order = 480 # After Basic auth
+
+    def __init__(self, url, password_mgr):
+        self.url = url
+        self.password_mgr = password_mgr
+        self.used = False
+
+    def reset(self):
+        self.password_mgr.rb_user = options.http_username
+        self.password_mgr.rb_pass = options.http_password
+        self.used = False
+
+    def http_request(self, request):
+        if options.username and not self.used:
+            # Note that we call password_mgr.find_user_password to get the
+            # username and password we're working with. This allows us to
+            # prompt if, say, --username was specified but --password was not.
+            username, password = \
+                self.password_mgr.find_user_password('Web API', self.url)
+            raw = '%s:%s' % (username, password)
+            request.add_header(
+                urllib2.HTTPBasicAuthHandler.auth_header,
+                'Basic %s' % base64.b64encode(raw).strip())
+            self.used = True
+
+        return request
+
+    https_request = http_request
+
+
+class ReviewBoardHTTPErrorProcessor(urllib2.HTTPErrorProcessor):
+    """Processes HTTP error codes.
+
+    Python 2.6 gets HTTP error code processing right, but 2.4 and 2.5 only
+    accepts HTTP 200 and 206 as success codes. This handler ensures that
+    anything in the 200 range is a success.
+    """
+    def http_response(self, request, response):
+        if not (200 <= response.code < 300):
+            response = self.parent.error('http', request, response,
+                                         response.code, response.msg,
+                                         response.info())
+
+        return response
+
+    https_response = http_response
+
+
+class ReviewBoardHTTPBasicAuthHandler(urllib2.HTTPBasicAuthHandler):
+    """Custom Basic Auth handler that doesn't retry excessively.
+
+    urllib2's HTTPBasicAuthHandler retries over and over, which is useless.
+    This subclass only retries once to make sure we've attempted with a
+    valid username and password. It will then fail so we can use
+    tempt_fate's retry handler.
+    """
+    def __init__(self, *args, **kwargs):
+        urllib2.HTTPBasicAuthHandler.__init__(self, *args, **kwargs)
+        self._retried = False
+        self._lasturl = ""
+
+    def retry_http_basic_auth(self, *args, **kwargs):
+        if self._lasturl != args[0]:
+            self._retried = False
+
+        self._lasturl = args[0]
+
+        if not self._retried:
+            self._retried = True
+            self.retried = 0
+            response = urllib2.HTTPBasicAuthHandler.retry_http_basic_auth(
+                self, *args, **kwargs)
+
+            if response.code != 401:
+                self._retried = False
+
+            return response
+        else:
+            return None
 
 
 class ReviewBoardHTTPPasswordMgr(urllib2.HTTPPasswordMgr):
@@ -260,11 +435,11 @@ class ReviewBoardHTTPPasswordMgr(urllib2.HTTPPasswordMgr):
 
     See: http://bugs.python.org/issue974757
     """
-    def __init__(self, reviewboard_url):
+    def __init__(self, reviewboard_url, rb_user=None, rb_pass=None):
         self.passwd  = {}
         self.rb_url  = reviewboard_url
-        self.rb_user = None
-        self.rb_pass = None
+        self.rb_user = rb_user
+        self.rb_pass = rb_pass
 
     def find_user_password(self, realm, uri):
         if uri.startswith(self.rb_url):
@@ -274,10 +449,14 @@ class ReviewBoardHTTPPasswordMgr(urllib2.HTTPPasswordMgr):
                         'used with --diff-filename=-')
 
                 print "==> HTTP Authentication Required"
-                print 'Enter username and password for "%s" at %s' % \
+                print 'Enter authorization information for "%s" at %s' % \
                     (realm, urlparse(uri)[1])
-                self.rb_user = raw_input('Username: ')
-                self.rb_pass = getpass.getpass('Password: ')
+
+                if not self.rb_user:
+                    self.rb_user = raw_input('Username: ')
+
+                if not self.rb_pass:
+                    self.rb_pass = getpass.getpass('Password: ')
 
             return self.rb_user, self.rb_pass
         else:
@@ -296,59 +475,110 @@ class ReviewBoardServer(object):
             self.url += '/'
         self._info = info
         self._server_info = None
+        self.root_resource = None
+        self.deprecated_api = False
         self.cookie_file = cookie_file
         self.cookie_jar  = cookielib.MozillaCookieJar(self.cookie_file)
 
+        if self.cookie_file:
+            try:
+                self.cookie_jar.load(self.cookie_file, ignore_expires=True)
+            except IOError:
+                pass
+
         # Set up the HTTP libraries to support all of the features we need.
         cookie_handler      = urllib2.HTTPCookieProcessor(self.cookie_jar)
-        password_mgr        = ReviewBoardHTTPPasswordMgr(self.url)
-        basic_auth_handler  = urllib2.HTTPBasicAuthHandler(password_mgr)
+        password_mgr        = ReviewBoardHTTPPasswordMgr(self.url,
+                                                         options.username,
+                                                         options.password)
+        basic_auth_handler  = ReviewBoardHTTPBasicAuthHandler(password_mgr)
         digest_auth_handler = urllib2.HTTPDigestAuthHandler(password_mgr)
+        self.preset_auth_handler = PresetHTTPAuthHandler(self.url, password_mgr)
+        http_error_processor = ReviewBoardHTTPErrorProcessor()
 
         opener = urllib2.build_opener(cookie_handler,
                                       basic_auth_handler,
-                                      digest_auth_handler)
+                                      digest_auth_handler,
+                                      self.preset_auth_handler,
+                                      http_error_processor)
         opener.addheaders = [('User-agent', 'RBTools/' + get_package_version())]
         urllib2.install_opener(opener)
+
+    def check_api_version(self):
+        """Checks the API version on the server to determine which to use."""
+        try:
+            root_resource = self.api_get('api/')
+            rsp = self.api_get(root_resource['links']['info']['href'])
+
+            self.rb_version = rsp['info']['product']['package_version']
+
+            if parse_version(self.rb_version) >= parse_version('1.5.2'):
+                self.deprecated_api = False
+                self.root_resource = root_resource
+                debug('Using the new web API')
+                return True
+        except APIError, e:
+            if e.http_status not in (401, 404):
+                # We shouldn't reach this. If there's a permission denied
+                # from lack of logging in, then the basic auth handler
+                # should have hit it.
+                #
+                # However in some versions it wants you to be logged in
+                # and returns a 401 from the application after you've
+                # done your http basic auth
+                die("Unable to access the root /api/ URL on the server.")
+
+            return False
+
+        # This is an older Review Board server with the old API.
+        self.deprecated_api = True
+        debug('Using the deprecated Review Board 1.0 web API')
+        return True
 
     def login(self, force=False):
         """
         Logs in to a Review Board server, prompting the user for login
         information if needed.
         """
-        if not force and self.has_valid_cookie():
-            return
-
         if (options.diff_filename == '-' and
             not options.username and not options.submit_as and
             not options.password):
             die('Authentication information needs to be provided on '
                 'the command line when using --diff-filename=-')
 
-        print "==> Review Board Login Required"
-        print "Enter username and password for Review Board at %s" % self.url
-        if options.username:
-            username = options.username
-        elif options.submit_as:
-            username = options.submit_as
-        else:
-            username = raw_input('Username: ')
+        if self.deprecated_api:
+            print "==> Review Board Login Required"
+            print "Enter username and password for Review Board at %s" % \
+                  self.url
 
-        if not options.password:
-            password = getpass.getpass('Password: ')
-        else:
-            password = options.password
+            if options.username:
+                username = options.username
+            elif options.submit_as:
+                username = options.submit_as
+            elif not force and self.has_valid_cookie():
+                # We delay the check for a valid cookie until after looking
+                # at args, so that it doesn't override the command line.
+                return
+            else:
+                username = raw_input('Username: ')
 
-        debug('Logging in with username "%s"' % username)
-        try:
-            self.api_post('api/json/accounts/login/', {
-                'username': username,
-                'password': password,
-            })
-        except APIError, e:
-            die("Unable to log in: %s" % e)
+            if not options.password:
+                password = getpass.getpass('Password: ')
+            else:
+                password = options.password
 
-        debug("Logged in.")
+            debug('Logging in with username "%s"' % username)
+            try:
+                self.api_post('api/json/accounts/login/', {
+                    'username': username,
+                    'password': password,
+                })
+            except APIError, e:
+                die("Unable to log in: %s" % e)
+
+            debug("Logged in.")
+        elif force:
+            self.preset_auth_handler.reset()
 
     def has_valid_cookie(self):
         """
@@ -365,9 +595,12 @@ class ReviewBoardServer(object):
             # get rid of the port number if it's present.
             host = host.split(":")[0]
 
+            # Cookie files also append .local to bare hostnames
+            if '.' not in host:
+                host += '.local'
+
             debug("Looking for '%s %s' cookie in %s" % \
                   (host, path, self.cookie_file))
-            self.cookie_jar.load(self.cookie_file, ignore_expires=True)
 
             try:
                 cookie = self.cookie_jar._cookies[host][path]['rbsessionid']
@@ -383,6 +616,13 @@ class ReviewBoardServer(object):
             debug("Couldn't load cookie file: %s" % error)
 
         return False
+
+    def get_configured_repository(self):
+        for config in configs:
+            if 'REPOSITORY' in config:
+                return config['REPOSITORY']
+
+        return None
 
     def new_review_request(self, changenum, submit_as=None):
         """
@@ -407,10 +647,39 @@ class ReviewBoardServer(object):
                     self.info.path = repository['path']
                     break
 
+            if isinstance(self.info.path, list):
+                sys.stderr.write('\n')
+                sys.stderr.write('There was an error creating this review '
+                                 'request.\n')
+                sys.stderr.write('\n')
+                sys.stderr.write('There was no matching repository path'
+                                 'found on the server.\n')
+                sys.stderr.write('List of configured repositories:\n')
+
+                for repository in repositories:
+                    sys.stderr.write('\t%s\n' % repository['path'])
+
+                sys.stderr.write('Unknown repository paths found:\n')
+
+                for foundpath in self.info.path:
+                    sys.stderr.write('\t%s\n' % foundpath)
+
+                sys.stderr.write('Ask the administrator to add one of '
+                                 'these repositories\n')
+                sys.stderr.write('to the Review Board server.\n')
+                sys.stderr.write('For information on adding repositories, '
+                                 'please read\n')
+                sys.stderr.write(ADD_REPOSITORY_DOCS_URL + '\n')
+                die()
+
+        repository = options.repository_url \
+                     or self.get_configured_repository() \
+                     or self.info.path
+
         try:
             debug("Attempting to create review request on %s for %s" %
-                  (self.info.path, changenum))
-            data = { 'repository_path': self.info.path }
+                  (repository, changenum))
+            data = {}
 
             if changenum:
                 data['changenum'] = changenum
@@ -419,7 +688,16 @@ class ReviewBoardServer(object):
                 debug("Submitting the review request as %s" % submit_as)
                 data['submit_as'] = submit_as
 
-            rsp = self.api_post('api/json/reviewrequests/new/', data)
+            if self.deprecated_api:
+                data['repository_path'] = repository
+                rsp = self.api_post('api/json/reviewrequests/new/', data)
+            else:
+                data['repository'] = repository
+
+                links = self.root_resource['links']
+                assert 'review_requests' in links
+                review_request_href = links['review_requests']['href']
+                rsp = self.api_post(review_request_href, data)
         except APIError, e:
             if e.error_code == 204: # Change number in use
                 rsp = e.rsp
@@ -429,9 +707,8 @@ class ReviewBoardServer(object):
                     debug("Review request already exists.")
                 else:
                     debug("Review request already exists. Updating it...")
-                    rsp = self.api_post(
-                        'api/json/reviewrequests/%s/update_from_changenum/' %
-                        rsp['review_request']['id'])
+                    self.update_review_request_from_changenum(
+                        changenum, rsp['review_request'])
             elif e.error_code == 206: # Invalid repository
                 sys.stderr.write('\n')
                 sys.stderr.write('There was an error creating this review '
@@ -454,6 +731,16 @@ class ReviewBoardServer(object):
 
         return rsp['review_request']
 
+    def update_review_request_from_changenum(self, changenum, review_request):
+        if self.deprecated_api:
+            self.api_post(
+                'api/json/reviewrequests/%s/update_from_changenum/'
+                % review_request['id'])
+        else:
+            self.api_put(review_request['links']['self']['href'], {
+                'changenum': review_request['changenum'],
+            })
+
     def set_review_request_field(self, review_request, field, value):
         """
         Sets a field in a review request to the specified value.
@@ -463,37 +750,75 @@ class ReviewBoardServer(object):
         debug("Attempting to set field '%s' to '%s' for review request '%s'" %
               (field, value, rid))
 
-        self.api_post('api/json/reviewrequests/%s/draft/set/' % rid, {
-            field: value,
-        })
+        if self.deprecated_api:
+            self.api_post('api/json/reviewrequests/%s/draft/set/' % rid, {
+                field: value,
+            })
+        else:
+            self.api_put(review_request['links']['draft']['href'], {
+                field: value,
+            })
 
     def get_review_request(self, rid):
         """
         Returns the review request with the specified ID.
         """
-        rsp = self.api_get('api/json/reviewrequests/%s/' % rid)
+        if self.deprecated_api:
+            url = 'api/json/reviewrequests/%s/' % rid
+        else:
+            url = '%s%s/' % (
+                self.root_resource['links']['review_requests']['href'], rid)
+
+        rsp = self.api_get(url)
+
         return rsp['review_request']
 
     def get_repositories(self):
         """
         Returns the list of repositories on this server.
         """
-        rsp = self.api_get('/api/json/repositories/')
-        return rsp['repositories']
+        if self.deprecated_api:
+            rsp = self.api_get('api/json/repositories/')
+            repositories = rsp['repositories']
+        else:
+            rsp = self.api_get(
+                self.root_resource['links']['repositories']['href'])
+            repositories = rsp['repositories']
+
+            while 'next' in rsp['links']:
+                rsp = self.api_get(rsp['links']['next']['href'])
+                repositories.extend(rsp['repositories'])
+
+        return repositories
 
     def get_repository_info(self, rid):
         """
         Returns detailed information about a specific repository.
         """
-        rsp = self.api_get('/api/json/repositories/%s/info/' % rid)
+        if self.deprecated_api:
+            url = 'api/json/repositories/%s/info/' % rid
+        else:
+            rsp = self.api_get(
+                '%s%s/' % (self.root_resource['links']['repositories']['href'],
+                           rid))
+            url = rsp['repository']['links']['info']['href']
+
+        rsp = self.api_get(url)
+
         return rsp['info']
 
     def save_draft(self, review_request):
         """
         Saves a draft of a review request.
         """
-        self.api_post("api/json/reviewrequests/%s/draft/save/" %
-                      review_request['id'])
+        if self.deprecated_api:
+            self.api_post('api/json/reviewrequests/%s/draft/save/' % \
+                          review_request['id'])
+        else:
+            self.api_put(review_request['links']['draft']['href'], {
+                'public': 1,
+            })
+
         debug("Review request draft saved")
 
     def upload_diff(self, review_request, diff_content, parent_diff_content):
@@ -522,16 +847,40 @@ class ReviewBoardServer(object):
                 'content': parent_diff_content
             }
 
-        self.api_post('api/json/reviewrequests/%s/diff/new/' %
-                      review_request['id'], fields, files)
+        if self.deprecated_api:
+            self.api_post('api/json/reviewrequests/%s/diff/new/' %
+                          review_request['id'], fields, files)
+        else:
+            self.api_post(review_request['links']['diffs']['href'],
+                          fields, files)
+
+    def reopen(self, review_request):
+        """
+        Reopen discarded review request.
+        """
+        debug("Reopening")
+
+        if self.deprecated_api:
+            self.api_post('api/json/reviewrequests/%s/reopen/' %
+                          review_request['id'])
+        else:
+            self.api_put(review_request['links']['self']['href'], {
+                'status': 'pending',
+            })
 
     def publish(self, review_request):
         """
         Publishes a review request.
         """
         debug("Publishing")
-        self.api_post('api/json/reviewrequests/%s/publish/' %
-                      review_request['id'])
+
+        if self.deprecated_api:
+            self.api_post('api/json/reviewrequests/%s/publish/' %
+                          review_request['id'])
+        else:
+            self.api_put(review_request['links']['draft']['href'], {
+                'public': 1,
+            })
 
     def _get_server_info(self):
         if not self._server_info:
@@ -546,9 +895,12 @@ class ReviewBoardServer(object):
         Loads in a JSON file and returns the data if successful. On failure,
         APIError is raised.
         """
-        rsp = json.loads(data)
+        rsp = json_loads(data)
 
         if rsp['stat'] == 'fail':
+            # With the new API, we should get something other than HTTP
+            # 200 for errors, in which case we wouldn't get this far.
+            assert self.deprecated_api
             self.process_error(200, data)
 
         return rsp
@@ -556,7 +908,7 @@ class ReviewBoardServer(object):
     def process_error(self, http_status, data):
         """Processes an error, raising an APIError with the information."""
         try:
-            rsp = json.loads(data)
+            rsp = json_loads(data)
 
             assert rsp['stat'] == 'fail'
 
@@ -578,12 +930,21 @@ class ReviewBoardServer(object):
 
         url = self._make_url(path)
         rsp = urllib2.urlopen(url).read()
-        self.cookie_jar.save(self.cookie_file)
+
+        try:
+            self.cookie_jar.save(self.cookie_file)
+        except IOError, e:
+            debug('Failed to write cookie file: %s' % e)
         return rsp
 
     def _make_url(self, path):
         """Given a path on the server returns a full http:// style url"""
+        if path.startswith('http'):
+            # This is already a full path.
+            return path
+
         app = urlparse(self.url)[2]
+
         if path[0] == '/':
             url = urljoin(self.url, app[:-1] + path)
         else:
@@ -624,7 +985,66 @@ class ReviewBoardServer(object):
         }
 
         try:
-            r = urllib2.Request(url, body, headers)
+            r = urllib2.Request(str(url), body, headers)
+            data = urllib2.urlopen(r).read()
+            try:
+                self.cookie_jar.save(self.cookie_file)
+            except IOError, e:
+                debug('Failed to write cookie file: %s' % e)
+            return data
+        except urllib2.HTTPError, e:
+            # Re-raise so callers can interpret it.
+            raise e
+        except urllib2.URLError, e:
+            try:
+                debug(e.read())
+            except AttributeError:
+                pass
+
+            die("Unable to access %s. The host path may be invalid\n%s" % \
+                (url, e))
+
+    def http_put(self, path, fields):
+        """
+        Performs an HTTP PUT on the specified path, storing any cookies that
+        were set.
+        """
+        url = self._make_url(path)
+        debug('HTTP PUTting to %s: %s' % (url, fields))
+
+        content_type, body = self._encode_multipart_formdata(fields, None)
+        headers = {
+            'Content-Type': content_type,
+            'Content-Length': str(len(body))
+        }
+
+        try:
+            r = HTTPRequest(url, body, headers, method='PUT')
+            data = urllib2.urlopen(r).read()
+            self.cookie_jar.save(self.cookie_file)
+            return data
+        except urllib2.HTTPError, e:
+            # Re-raise so callers can interpret it.
+            raise e
+        except urllib2.URLError, e:
+            try:
+                debug(e.read())
+            except AttributeError:
+                pass
+
+            die("Unable to access %s. The host path may be invalid\n%s" % \
+                (url, e))
+
+    def http_delete(self, path):
+        """
+        Performs an HTTP DELETE on the specified path, storing any cookies that
+        were set.
+        """
+        url = self._make_url(path)
+        debug('HTTP DELETing %s' % url)
+
+        try:
+            r = HTTPRequest(url, method='DELETE')
             data = urllib2.urlopen(r).read()
             self.cookie_jar.save(self.cookie_file)
             return data
@@ -649,6 +1069,24 @@ class ReviewBoardServer(object):
         except urllib2.HTTPError, e:
             self.process_error(e.code, e.read())
 
+    def api_put(self, path, fields=None):
+        """
+        Performs an API call using HTTP PUT at the specified path.
+        """
+        try:
+            return self.process_json(self.http_put(path, fields))
+        except urllib2.HTTPError, e:
+            self.process_error(e.code, e.read())
+
+    def api_delete(self, path):
+        """
+        Performs an API call using HTTP DELETE at the specified path.
+        """
+        try:
+            return self.process_json(self.http_delete(path))
+        except urllib2.HTTPError, e:
+            self.process_error(e.code, e.read())
+
     def _encode_multipart_formdata(self, fields, files):
         """
         Encodes data for use in an HTTP POST.
@@ -663,7 +1101,7 @@ class ReviewBoardServer(object):
             content += "--" + BOUNDARY + "\r\n"
             content += "Content-Disposition: form-data; name=\"%s\"\r\n" % key
             content += "\r\n"
-            content += fields[key] + "\r\n"
+            content += str(fields[key]) + "\r\n"
 
         for key in files:
             filename = files[key]['filename']
@@ -690,25 +1128,29 @@ class SCMClient(object):
     def get_repository_info(self):
         return None
 
+    def check_options(self):
+        pass
+
     def scan_for_server(self, repository_info):
         """
         Scans the current directory on up to find a .reviewboard file
         containing the server path.
         """
-        server_url = self._get_server_from_config(user_config, repository_info)
-        if server_url:
-            return server_url
+        server_url = None
 
-        for path in walk_parents(os.getcwd()):
-            filename = os.path.join(path, ".reviewboardrc")
-            if os.path.exists(filename):
-                config = load_config_file(filename)
+        if user_config:
+            server_url = self._get_server_from_config(user_config,
+                                                      repository_info)
+
+        if not server_url:
+            for config in configs:
                 server_url = self._get_server_from_config(config,
                                                           repository_info)
-                if server_url:
-                    return server_url
 
-        return None
+                if server_url:
+                    break
+
+        return server_url
 
     def diff(self, args):
         """
@@ -723,7 +1165,7 @@ class SCMClient(object):
         """
         Returns the generated diff between revisions in the repository.
         """
-        return None
+        return (None, None)
 
     def _get_server_from_config(self, config, repository_info):
         if 'REVIEWBOARD_URL' in config:
@@ -773,7 +1215,7 @@ class CVSClient(SCMClient):
         if i != -1:
             repository_path = repository_path[i + 1:]
 
-        i = repository_path.find(":")
+        i = repository_path.rfind(":")
         if i != -1:
             host = repository_path[:i]
             try:
@@ -804,7 +1246,7 @@ class CVSClient(SCMClient):
         for rev in revision_range.split(":"):
             revs += ["-r", rev]
 
-        return self.do_diff(revs)
+        return (self.do_diff(revs + args), None)
 
     def do_diff(self, params):
         """
@@ -822,308 +1264,324 @@ class ClearCaseClient(SCMClient):
     information and generates compatible diffs.
     This client assumes that cygwin is installed on windows.
     """
-    ccroot_path = "/view/reviewboard.diffview/vobs/"
-    viewinfo = ""
-    viewtype = "snapshot"
-
-    def get_filename_hash(self, fname):
-        # Hash the filename string so its easy to find the file later on.
-        return md5(fname).hexdigest()
+    viewtype = None
 
     def get_repository_info(self):
+        """Returns information on the Clear Case repository.
+
+        This will first check if the cleartool command is
+        installed and in the path, and post-review was run
+        from inside of the view.
+        """
         if not check_install('cleartool help'):
             return None
 
-        # We must be running this from inside a view.
-        # Otherwise it doesn't make sense.
-        self.viewinfo = execute(["cleartool", "pwv", "-short"])
-        if self.viewinfo.startswith('\*\* NONE'):
+        viewname = execute(["cleartool", "pwv", "-short"]).strip()
+        if viewname.startswith('** NONE'):
             return None
 
-        # Returning the hardcoded clearcase root path to match the server
-        #   respository path.
-        # There is no reason to have a dynamic path unless you have
-        #   multiple clearcase repositories. This should be implemented.
-        return RepositoryInfo(path=self.ccroot_path,
-                              base_path=self.ccroot_path,
+        # Now that we know it's ClearCase, make sure we have GNU diff installed,
+        # and error out if we don't.
+        check_gnu_diff()
+
+        property_lines = execute(["cleartool", "lsview", "-full", "-properties",
+                                  "-cview"], split_lines=True)
+        for line in property_lines:
+            properties = line.split(' ')
+            if properties[0] == 'Properties:':
+                # Determine the view type and check if it's supported.
+                #
+                # Specifically check if webview was listed in properties
+                # because webview types also list the 'snapshot'
+                # entry in properties.
+                if 'webview' in properties:
+                    die("Webviews are not supported. You can use post-review"
+                        " only in dynamic or snapshot view.")
+                if 'dynamic' in properties:
+                    self.viewtype = 'dynamic'
+                else:
+                    self.viewtype = 'snapshot'
+
+                break
+
+        # Find current VOB's tag
+        vobstag = execute(["cleartool", "describe", "-short", "vob:."],
+                            ignore_errors=True).strip()
+        if "Error: " in vobstag:
+            die("To generate diff run post-review inside vob.")
+
+        # From current working directory cut path to VOB.
+        # VOB's tag contain backslash character before VOB's name.
+        # I hope that first character of VOB's tag like '\new_proj'
+        # won't be treat as new line character but two separate:
+        # backslash and letter 'n'
+        cwd = os.getcwd()
+        base_path = cwd[:cwd.find(vobstag) + len(vobstag)]
+
+        return ClearCaseRepositoryInfo(path=base_path,
+                              base_path=base_path,
+                              vobstag=vobstag,
                               supports_parent_diffs=False)
 
-    def get_previous_version(self, files):
-        file = []
-        curdir = os.getcwd()
+    def check_options(self):
+        if ((options.revision_range or options.tracking)
+            and self.viewtype != "dynamic"):
+            die("To generate diff using parent branch or by passing revision "
+                "ranges, you must use a dynamic view.")
 
-        # Cygwin case must transform a linux-like path to windows like path
-        #   including drive letter.
-        if 'cygdrive' in curdir:
-            where = curdir.index('cygdrive') + 9
-            drive_letter = curdir[where:where+1]
-            curdir = drive_letter + ":\\" + curdir[where+2:len(curdir)]
+    def _determine_version(self, version_path):
+        """Determine numeric version of revision.
 
-        for key in files:
-            # Sometimes there is a quote in the filename. It must be removed.
-            key = key.replace('\'', '')
-            elem_path = cpath.normpath(os.path.join(curdir, key))
-
-            # Removing anything before the last /vobs
-            #   because it may be repeated.
-            elem_path_idx = elem_path.rfind("/vobs")
-            if elem_path_idx != -1:
-                elem_path = elem_path[elem_path_idx:len(elem_path)].strip("\"")
-
-            # Call cleartool to get this version and the previous version
-            #   of the element.
-            curr_version, pre_version = execute(
-                ["cleartool", "desc", "-pre", elem_path], split_lines=True)
-            curr_version = cpath.normpath(curr_version)
-            pre_version = pre_version.split(':')[1].strip()
-
-            # If a specific version was given, remove it from the path
-            #   to avoid version duplication
-            if "@@" in elem_path:
-                elem_path = elem_path[:elem_path.rfind("@@")]
-            file.append(elem_path + "@@" + pre_version)
-            file.append(curr_version)
-
-        # Determnine if the view type is snapshot or dynamic.
-        if os.path.exists(file[0]):
-            self.viewtype = "dynamic"
-
-        return file
-
-    def get_extended_namespace(self, files):
+        CHECKEDOUT is marked as infinity to be treated
+        always as highest possible version of file.
+        CHECKEDOUT, in ClearCase, is something like HEAD.
         """
-        Parses the file path to get the extended namespace
+        branch, number = cpath.split(version_path)
+        if number == 'CHECKEDOUT':
+            return float('inf')
+        return int(number)
+
+    def _construct_extended_path(self, path, version):
+        """Combine extended_path from path and version.
+
+        CHECKEDOUT must be removed becasue this one version
+        doesn't exists in MVFS (ClearCase dynamic view file
+        system). Only way to get content of checked out file
+        is to use filename only."""
+        if not version or version.endswith('CHECKEDOUT'):
+            return path
+
+        return "%s@@%s" % (path, version)
+
+    def _sanitize_branch_changeset(self, changeset):
+        """Return changeset containing non-binary, branched file versions.
+
+        Changeset contain only first and last version of file made on branch.
         """
-        versions = self.get_previous_version(files)
+        changelist = {}
 
-        evfiles = []
-        hlist = []
+        for path, previous, current in changeset:
+            version_number = self._determine_version(current)
 
-        for vkey in versions:
-            # Verify if it is a checkedout file.
-            if "CHECKEDOUT" in vkey:
-                # For checkedout files just add it to the file list
-                #   since it cannot be accessed outside the view.
-                splversions = vkey[:vkey.rfind("@@")]
-                evfiles.append(splversions)
-            else:
-                # For checkedin files.
-                ext_path = []
-                ver = []
-                fname = ""      # fname holds the file name without the version.
-                (bpath, fpath) = cpath.splitdrive(vkey)
-                if bpath :
-                    # Windows.
-                    # The version (if specified like file.c@@/main/1)
-                    #   should be kept as a single string
-                    #   so split the path and concat the file name
-                    #   and version in the last position of the list.
-                    ver = fpath.split("@@")
-                    splversions = fpath[:vkey.rfind("@@")].split("\\")
-                    fname = splversions.pop()
-                    splversions.append(fname + ver[1])
-                else :
-                    # Linux.
-                    bpath = vkey[:vkey.rfind("vobs")+4]
-                    fpath = vkey[vkey.rfind("vobs")+5:]
-                    ver = fpath.split("@@")
-                    splversions =  ver[0][:vkey.rfind("@@")].split("/")
-                    fname = splversions.pop()
-                    splversions.append(fname + ver[1])
+            if path not in changelist:
+                changelist[path] = {
+                    'highest': version_number,
+                    'current': current,
+                    'previous': previous
+                }
 
-                filename = splversions.pop()
-                bpath = cpath.normpath(bpath + "/")
-                elem_path = bpath
+            if version_number == 0:
+                # Previous version of 0 version on branch is base
+                changelist[path]['previous'] = previous
+            elif version_number > changelist[path]['highest']:
+                changelist[path]['highest'] = version_number
+                changelist[path]['current'] = current
 
-                for key in splversions:
-                    # For each element (directory) in the path,
-                    #   get its version from clearcase.
-                    elem_path = cpath.join(elem_path, key)
+        # Convert to list
+        changeranges = []
+        for path, version in changelist.iteritems():
+            changeranges.append(
+                (self._construct_extended_path(path, version['previous']),
+                 self._construct_extended_path(path, version['current']))
+            )
 
-                    # This is the version to be appended to the extended
-                    #   path list.
-                    this_version = execute(
-                        ["cleartool", "desc", "-fmt", "%Vn",
-                        cpath.normpath(elem_path)])
-                    if this_version:
-                        ext_path.append(key + "/@@" + this_version + "/")
-                    else:
-                        ext_path.append(key + "/")
+        return changeranges
 
-                # This must be done in case we haven't specified
-                #   the version on the command line.
-                ext_path.append(cpath.normpath(fname + "/@@" +
-                    vkey[vkey.rfind("@@")+2:len(vkey)]))
-                epstr = cpath.join(bpath, cpath.normpath(''.join(ext_path)))
-                evfiles.append(epstr)
+    def _sanitize_checkedout_changeset(self, changeset):
+        """Return changeset containing non-binary, checkdout file versions."""
 
-                """
-                In windows, there is a problem with long names(> 254).
-                In this case, we hash the string and copy the unextended
-                  filename to a temp file whose name is the hash.
-                This way we can get the file later on for diff.
-                The same problem applies to snapshot views where the
-                  extended name isn't available.
-                The previous file must be copied from the CC server
-                  to a local dir.
-                """
-                if cpath.exists(epstr) :
-                    pass
-                else:
-                    if len(epstr) > 254 or self.viewtype == "snapshot":
-                        name = self.get_filename_hash(epstr)
-                        # Check if this hash is already in the list
-                        try:
-                            i = hlist.index(name)
-                            die("ERROR: duplicate value %s : %s" %
-                                (name, epstr))
-                        except ValueError:
-                            hlist.append(name)
+        changeranges = []
+        for path, previous, current in changeset:
+            version_number = self._determine_version(current)
+            changeranges.append(
+                (self._construct_extended_path(path, previous),
+                self._construct_extended_path(path, current))
+            )
 
-                        normkey = cpath.normpath(vkey)
-                        td = tempfile.gettempdir()
-                        # Cygwin case must transform a linux-like path to
-                        # windows like path including drive letter
-                        if 'cygdrive' in td:
-                            where = td.index('cygdrive') + 9
-                            drive_letter = td[where:where+1] + ":"
-                            td = cpath.join(drive_letter, td[where+1:])
-                        tf = cpath.normpath(cpath.join(td, name))
-                        if cpath.exists(tf):
-                            debug("WARNING: FILE EXISTS")
-                            os.unlink(tf)
-                        execute(["cleartool", "get", "-to", tf, normkey])
-                    else:
-                        die("ERROR: FILE NOT FOUND : %s" % epstr)
+        return changeranges
 
-        return evfiles
+    def _directory_content(self, path):
+        """Return directory content ready for saving to tempfile."""
 
-    def get_files_from_label(self, label):
-        voblist=[]
-        # Get the list of vobs for the current view
-        allvoblist = execute(["cleartool", "lsvob", "-short"]).split()
-        # For each vob, find if the label is present
-        for vob in allvoblist:
-            try:
-                execute(["cleartool", "describe", "-local",
-                    "lbtype:%s@%s" % (label, vob)]).split()
-                voblist.append(vob)
-            except:
-                pass
+        return ''.join([
+            '%s\n' % s
+            for s in sorted(os.listdir(path))
+        ])
 
-        filelist=[]
-        # For each vob containing the label, get the file list
-        for vob in voblist:
-            try:
-                res = execute(["cleartool", "find", vob, "-all", "-version",
-                    "lbtype(%s)" % label, "-print"])
-                filelist.extend(res.split())
-            except :
-                pass
+    def _construct_changeset(self, output):
+        return [
+            info.split('\t')
+            for info in output.strip().split('\n')
+        ]
 
-        # Return only the unique itens
-        return set(filelist)
+    def get_checkedout_changeset(self):
+        """Return information about the checked out changeset.
+
+        This function returns: kind of element, path to file,
+        previews and current file version.
+        """
+        changeset = []
+        # We ignore return code 1 in order to
+        # omit files that Clear Case can't read.
+        output = execute([
+            "cleartool",
+            "lscheckout",
+            "-all",
+            "-cview",
+            "-me",
+            "-fmt",
+            r"%En\t%PVn\t%Vn\n"],
+            extra_ignore_errors=(1,),
+            with_errors=False)
+
+        if output:
+            changeset = self._construct_changeset(output)
+
+        return self._sanitize_checkedout_changeset(changeset)
+
+    def get_branch_changeset(self, branch):
+        """Returns information about the versions changed on a branch.
+
+        This takes into account the changes on the branch owned by the
+        current user in all vobs of the current view.
+        """
+        changeset = []
+
+        # We ignore return code 1 in order to
+        # omit files that Clear Case can't read.
+        if sys.platform.startswith('win'):
+            CLEARCASE_XPN = '%CLEARCASE_XPN%'
+        else:
+            CLEARCASE_XPN = '$CLEARCASE_XPN'
+
+        output = execute([
+            "cleartool",
+            "find",
+            "-all",
+            "-version",
+            "brtype(%s)" % branch,
+            "-exec",
+            'cleartool descr -fmt ' \
+            r'"%En\t%PVn\t%Vn\n" ' \
+            + CLEARCASE_XPN],
+            extra_ignore_errors=(1,),
+            with_errors=False)
+
+        if output:
+            changeset = self._construct_changeset(output)
+
+        return self._sanitize_branch_changeset(changeset)
 
     def diff(self, files):
-        """
-        Performs a diff of the specified file and its previous version.
-        """
-        # We must be running this from inside a view.
-        # Otherwise it doesn't make sense.
-        return self.do_diff(self.get_extended_namespace(files))
+        """Performs a diff of the specified file and its previous version."""
 
-    def diff_label(self, label):
-        """
-        Get the files that are attached to a label and diff them
-        TODO
-        """
-        return self.diff(self.get_files_from_label(label))
+        if options.tracking:
+            changeset = self.get_branch_changeset(options.tracking)
+        else:
+            changeset = self.get_checkedout_changeset()
+
+        return self.do_diff(changeset)
 
     def diff_between_revisions(self, revision_range, args, repository_info):
+        """Performs a diff between passed revisions or branch."""
+
+        # Convert revision range to list of:
+        # (previous version, current version) tuples
+        revision_range = revision_range.split(';')
+        changeset = zip(revision_range[0::2], revision_range[1::2])
+
+        return (self.do_diff(changeset)[0], None)
+
+    def diff_files(self, old_file, new_file):
+        """Return unified diff for file.
+
+        Most effective and reliable way is use gnu diff.
         """
-        Performs a diff between 2 revisions of a CC repository.
-        """
-        rev_str = ''
+        diff_cmd = ["diff", "-uN", old_file, new_file]
+        dl = execute(diff_cmd, extra_ignore_errors=(1,2),
+                     translate_newlines=False)
 
-        for rev in revision_range.split(":"):
-            rev_str += "-r %s " % rev
+        # If the input file has ^M characters at end of line, lets ignore them.
+        dl = dl.replace('\r\r\n', '\r\n')
+        dl = dl.splitlines(True)
 
-        return self.do_diff(rev_str)
+        # Special handling for the output of the diff tool on binary files:
+        #     diff outputs "Files a and b differ"
+        # and the code below expects the output to start with
+        #     "Binary files "
+        if (len(dl) == 1 and
+            dl[0].startswith('Files %s and %s differ' % (old_file, new_file))):
+            dl = ['Binary files %s and %s differ\n' % (old_file, new_file)]
 
-    def do_diff(self, params):
-        # Diff returns "1" if differences were found.
-        # Add the view name and view type to the description
-        if options.description:
-            options.description = ("VIEW: " + self.viewinfo +
-                "VIEWTYPE: " + self.viewtype + "\n" + options.description)
+        # We need oids of files to translate them to paths on reviewboard repository
+        old_oid = execute(["cleartool", "describe", "-fmt", "%On", old_file])
+        new_oid = execute(["cleartool", "describe", "-fmt", "%On", new_file])
+
+        if dl == [] or dl[0].startswith("Binary files "):
+            if dl == []:
+                dl = ["File %s in your changeset is unmodified\n" % new_file]
+
+            dl.insert(0, "==== %s %s ====\n" % (old_oid, new_oid))
+            dl.append('\n')
         else:
-            options.description = (self.viewinfo +
-                "VIEWTYPE: " + self.viewtype + "\n")
+            dl.insert(2, "==== %s %s ====\n" % (old_oid, new_oid))
 
-        o = []
-        Feol = False
-        while len(params) > 0:
-            # Read both original and modified files.
-            onam = params.pop(0)
-            mnam = params.pop(0)
-            file_data = []
-            do_rem = False
-            # If the filename length is greater than 254 char for windows,
-            #   we copied the file to a temp file
-            #   because the open will not work for path greater than 254.
-            # This is valid for the original and
-            #   modified files if the name size is > 254.
-            for filenam in (onam, mnam) :
-                if cpath.exists(filenam) and self.viewtype == "dynamic":
-                    do_rem = False
-                    fn = filenam
-                elif len(filenam) > 254 or self.viewtype == "snapshot":
-                    fn = self.get_filename_hash(filenam)
-                    fn = cpath.join(tempfile.gettempdir(), fn)
-                    do_rem = True
-                fd = open(cpath.normpath(fn))
-                fdata = fd.readlines()
-                fd.close()
-                file_data.append(fdata)
-                # If the file was temp, it should be removed.
-                if do_rem:
-                    os.remove(filenam)
+        return dl
 
-            modi = file_data.pop()
-            orig = file_data.pop()
+    def diff_directories(self, old_dir, new_dir):
+        """Return uniffied diff between two directories content.
 
-            # For snapshot views, the local directories must be removed because
-            #   they will break the diff on the server. Just replacing
-            #   everything before the view name (including the view name) for
-            #   vobs do the work.
-            if (self.viewtype == "snapshot"
-                and (sys.platform.startswith('win')
-                  or sys.platform.startswith('cygwin'))):
-                    vinfo = self.viewinfo.rstrip("\r\n")
-                    mnam = "c:\\\\vobs" + mnam[mnam.rfind(vinfo) + len(vinfo):]
-                    onam = "c:\\\\vobs" + onam[onam.rfind(vinfo) + len(vinfo):]
-            # Call the diff lib to generate a diff.
-            # The dates are bogus, since they don't natter anyway.
-            # The only thing is that two spaces are needed to the server
-            #   so it can identify the heades correctly.
-            diff = difflib.unified_diff(orig, modi, onam, mnam,
-               '  2002-02-21 23:30:39.942229878 -0800',
-               '  2002-02-21 23:30:50.442260588 -0800', lineterm=' \n')
-            # Transform the generator output into a string output
-            #   Use a comprehension instead of a generator,
-            #   so 2.3.x doesn't fail to interpret.
-            diffstr = ''.join([str(l) for l in diff])
-            # Workaround for the difflib no new line at end of file
-            #   problem.
-            if not diffstr.endswith('\n'):
-                diffstr = diffstr + ("\n\\ No newline at end of file\n")
-            o.append(diffstr)
+        Function save two version's content of directory to temp
+        files and treate them as casual diff between two files.
+        """
+        old_content = self._directory_content(old_dir)
+        new_content = self._directory_content(new_dir)
 
-        ostr = ''.join(o)
-        return (ostr, None) # diff, parent_diff (not supported)
+        old_tmp = make_tempfile(content=old_content)
+        new_tmp = make_tempfile(content=new_content)
+
+        diff_cmd = ["diff", "-uN", old_tmp, new_tmp]
+        dl = execute(diff_cmd,
+                     extra_ignore_errors=(1,2),
+                     translate_newlines=False,
+                     split_lines=True)
+
+        # Replacing temporary filenames to
+        # real directory names and add ids
+        if dl:
+            dl[0] = dl[0].replace(old_tmp, old_dir)
+            dl[1] = dl[1].replace(new_tmp, new_dir)
+            old_oid = execute(["cleartool", "describe", "-fmt", "%On", old_dir])
+            new_oid = execute(["cleartool", "describe", "-fmt", "%On", new_dir])
+            dl.insert(2, "==== %s %s ====\n" % (old_oid, new_oid))
+
+        return dl
+
+    def do_diff(self, changeset):
+        """Generates a unified diff for all files in the changeset."""
+
+        diff = []
+        for old_file, new_file in changeset:
+            dl = []
+            if cpath.isdir(new_file):
+                dl = self.diff_directories(old_file, new_file)
+            elif cpath.exists(new_file):
+                dl = self.diff_files(old_file, new_file)
+            else:
+                debug("File %s does not exist or access is denied." % new_file)
+                continue
+
+            if dl:
+                diff.append(''.join(dl))
+
+        return (''.join(diff), None)
 
 
 class SVNClient(SCMClient):
+    # Match the diff control lines generated by 'svn diff'.
+    DIFF_ORIG_FILE_LINE_RE = re.compile(r'^---\s+.*\s+\(.*\)')
+    DIFF_NEW_FILE_LINE_RE = re.compile(r'^\+\+\+\s+.*\s+\(.*\)')
+
     """
     A wrapper around the svn Subversion tool that fetches repository
     information and generates compatible diffs.
@@ -1164,6 +1622,15 @@ class SVNClient(SCMClient):
 
         return SvnRepositoryInfo(path, base_path, m.group(1))
 
+    def check_options(self):
+        if (options.repository_url and
+            not options.revision_range and
+            not options.diff_filename):
+            sys.stderr.write("The --repository-url option requires either the "
+                             "--revision-range option or the --diff-filename "
+                             "option.\n")
+            sys.exit(1)
+
     def scan_for_server(self, repository_info):
         # Scan first for dot files, since it's faster and will cover the
         # user's $HOME/.reviewboardrc
@@ -1197,6 +1664,13 @@ class SVNClient(SCMClient):
         (the second value in the tuple).
         """
         return (self.do_diff(["svn", "diff", "--diff-cmd=diff"] + files),
+                None)
+
+    def diff_changelist(self, changelist):
+        """
+        Performs a diff for a local changelist.
+        """
+        return (self.do_diff(["svn", "diff", "--changelist", changelist]),
                 None)
 
     def diff_between_revisions(self, revision_range, args, repository_info):
@@ -1233,14 +1707,14 @@ class SVNClient(SCMClient):
 
             old_url = url + '@' + revisions[0]
 
-            return self.do_diff(["svn", "diff", "--diff-cmd=diff", old_url,
-                                 new_url] + files,
-                                repository_info)
+            return (self.do_diff(["svn", "diff", "--diff-cmd=diff", old_url,
+                                  new_url] + files,
+                                 repository_info), None)
         # Otherwise, perform the revision range diff using a working copy
         else:
-            return self.do_diff(["svn", "diff", "--diff-cmd=diff", "-r",
-                                 revision_range],
-                                repository_info)
+            return (self.do_diff(["svn", "diff", "--diff-cmd=diff", "-r",
+                                  revision_range],
+                                 repository_info), None)
 
     def do_diff(self, cmd, repository_info=None):
         """
@@ -1272,12 +1746,12 @@ class SVNClient(SCMClient):
 
         from_line = ""
         for line in diff_content:
-            if line.startswith('--- '):
+            if self.DIFF_ORIG_FILE_LINE_RE.match(line):
                 from_line = line
                 continue
 
             # This is where we decide how mangle the previous '--- '
-            if line.startswith('+++ '):
+            if self.DIFF_NEW_FILE_LINE_RE.match(line):
                 to_file, _ = self.parse_filename_header(line[4:])
                 info       = self.svn_info(to_file)
                 if info.has_key("Copied From URL"):
@@ -1306,7 +1780,9 @@ class SVNClient(SCMClient):
 
         for line in diff_content:
             front = None
-            if line.startswith('+++ ') or line.startswith('--- ') or line.startswith('Index: '):
+            if (self.DIFF_NEW_FILE_LINE_RE.match(line)
+                or self.DIFF_ORIG_FILE_LINE_RE.match(line)
+                or line.startswith('Index: ')):
                 front, line = line.split(" ", 1)
 
             if front:
@@ -1451,15 +1927,20 @@ class PerforceClient(SCMClient):
         return None
 
     def get_changenum(self, args):
-        if len(args) == 1:
+        if len(args) == 0:
+            return "default"
+        elif len(args) == 1:
             if args[0] == "default":
                 return "default"
 
             try:
                 return str(int(args[0]))
             except ValueError:
-                pass
-        return None
+                # (if it isn't a number, it can't be a cln)
+                return None
+        # there are multiple args (not a cln)
+        else:
+            return None
 
     def diff(self, args):
         """
@@ -1473,6 +1954,9 @@ class PerforceClient(SCMClient):
 
         if options.p4_port:
            os.environ['P4PORT'] = options.p4_port
+
+        if options.p4_passwd:
+            os.environ['P4PASSWD'] = options.p4_passwd
 
         changenum = self.get_changenum(args)
         if changenum is None:
@@ -1539,7 +2023,7 @@ class PerforceClient(SCMClient):
             # 'depotFile': '...'
             # 'change': '123456'
             for record in records:
-                if record['action'] != 'delete':
+                if record['action'] not in ('delete', 'move/delete'):
                     if revision2:
                         files[record['depotFile']] = [record, None]
                     else:
@@ -1550,7 +2034,7 @@ class PerforceClient(SCMClient):
                 second_rev_path = m.group('path') + revision2[1:]
                 records = self._run_p4(['files', second_rev_path])
                 for record in records:
-                    if record['action'] != 'delete':
+                    if record['action'] not in ('delete', 'move/delete'):
                         try:
                             m = files[record['depotFile']]
                             m[1] = record
@@ -1574,6 +2058,11 @@ class PerforceClient(SCMClient):
                     old_file = tmp_diff_from_filename
                     changetype_short = 'D'
                     base_revision = int(first_record['rev'])
+                elif first_record['rev'] == second_record['rev']:
+                    # We when we know the revisions are the same, we don't need
+                    # to do any diffing. This speeds up large revision-range
+                    # diffs quite a bit.
+                    continue
                 else:
                     self._write_file(depot_path + '#' + first_record['rev'],
                                      tmp_diff_from_filename)
@@ -1644,8 +2133,15 @@ class PerforceClient(SCMClient):
             v = self.p4d_version
 
             if v[0] < 2002 or (v[0] == "2002" and v[1] < 2):
-                description = execute(["p4", "describe", "-s", changenum],
-                                      split_lines=True)
+                describeCmd = ["p4"]
+
+                if options.p4_passwd:
+                    describeCmd.append("-P")
+                    describeCmd.append(options.p4_passwd)
+
+                describeCmd = describeCmd + ["describe", "-s", changenum]
+
+                description = execute(describeCmd, split_lines=True)
 
                 if '*pending*' in description[0]:
                     return None
@@ -1672,8 +2168,18 @@ class PerforceClient(SCMClient):
         if changenum == "default":
             cl_is_pending = True
         else:
-            description = execute(["p4", "describe", "-s", changenum],
-                                  split_lines=True)
+            describeCmd = ["p4"]
+
+            if options.p4_passwd:
+                describeCmd.append("-P")
+                describeCmd.append(options.p4_passwd)
+
+            describeCmd = describeCmd + ["describe", "-s", changenum]
+
+            description = execute(describeCmd, split_lines=True)
+
+            if re.search("no such changelist", description[0]):
+                die("CLN %s does not exist." % changenum)
 
             # Some P4 wrappers are addding an extra line before the description
             if '*pending*' in description[0] or '*pending*' in description[1]:
@@ -1688,6 +2194,9 @@ class PerforceClient(SCMClient):
             # so we have to get it a different way.
             info = execute(["p4", "opened", "-c", str(changenum)],
                            split_lines=True)
+
+            if len(info) == 1 and info[0].startswith("File(s) not opened on this client."):
+                die("Couldn't find any affected files for this change.")
 
             for line in info:
                 data = line.split(" ")
@@ -1912,126 +2421,273 @@ class MercurialClient(SCMClient):
     A wrapper around the hg Mercurial tool that fetches repository
     information and generates compatible diffs.
     """
+
+    def __init__(self):
+        self.hgrc = {}
+        self._type = 'hg'
+        self._hg_root = ''
+        self._remote_path = ()
+        self._hg_env = {
+            'HGRCPATH': os.devnull,
+            'HGPLAIN': '1',
+        }
+
+        # `self._remote_path_candidates` is an ordered set of hgrc
+        # paths that are checked if `parent_branch` option is not given
+        # explicitly.  The first candidate found to exist will be used,
+        # falling back to `default` (the last member.)
+        self._remote_path_candidates = ['reviewboard', 'origin', 'parent',
+                                        'default']
+
     def get_repository_info(self):
         if not check_install('hg --help'):
             return None
 
-        data = execute(["hg", "root"], ignore_errors=True)
-        if data.startswith('abort:'):
+        self._load_hgrc()
+
+        if not self.hg_root:
             # hg aborted => no mercurial repository here.
             return None
 
-        # Elsewhere, hg root output give us the repository path.
+        svn_info = execute(["hg", "svn", "info"], ignore_errors=True)
 
-        # We save data here to use it as a fallback. See below
-        local_data = data.strip()
+        if (not svn_info.startswith('abort:') and
+            not svn_info.startswith("hg: unknown command") and
+            not svn_info.lower().startswith('not a child of')):
+            return self._calculate_hgsubversion_repository_info(svn_info)
 
-        svn = execute(["hg", "svn", "info", ], ignore_errors=True)
+        self._type = 'hg'
 
-        if (not svn.startswith('abort:') and
-            not svn.startswith("hg: unknown command")):
-            self.type = 'svn'
-            m = re.search(r'^Repository Root: (.+)$', svn, re.M)
+        path = self.hg_root
+        base_path = '/'
 
-            if not m:
-                return None
+        if self.hgrc:
+            self._calculate_remote_path()
 
-            path = m.group(1)
-            m2 = re.match(r'^(svn\+ssh|http|https)://([-a-zA-Z0-9.]*@)(.*)$',
-                          path)
-            if m2:
-                path = '%s://%s' % (m2.group(1), m2.group(3))
+            if self._remote_path:
+                path = self._remote_path[1]
+                base_path = ''
 
-            m = re.search(r'^URL: (.+)$', svn, re.M)
+        return RepositoryInfo(path=path, base_path=base_path,
+                              supports_parent_diffs=True)
 
-            if not m:
-                return None
+    def _calculate_remote_path(self):
+        for candidate in self._remote_path_candidates:
 
-            base_path = m.group(1)[len(path):] or "/"
-            return RepositoryInfo(path=path,
-                                  base_path=base_path,
-                                  supports_parent_diffs=True)
+            rc_key = 'paths.%s' % candidate
 
-        self.type = 'hg'
+            if (not self._remote_path and self.hgrc.get(rc_key)):
+                self._remote_path = (candidate, self.hgrc.get(rc_key))
+                debug('Using candidate path %r: %r' % self._remote_path)
 
-        # We are going to search .hg/hgrc for the default path.
-        file_name = os.path.join(local_data,'.hg', 'hgrc')
+                return
 
-        if not os.path.exists(file_name):
-            return RepositoryInfo(path=local_data, base_path='/',
-                                  supports_parent_diffs=True)
-
-        f = open(file_name)
-        data = f.read()
-        f.close()
-
-        m = re.search(r'^default\s+=\s+(.+)$', data, re.M)
+    def _calculate_hgsubversion_repository_info(self, svn_info):
+        self._type = 'svn'
+        m = re.search(r'^Repository Root: (.+)$', svn_info, re.M)
 
         if not m:
-            # Return the local path, if no default value is found.
-            return RepositoryInfo(path=local_data, base_path='/',
-                                  supports_parent_diffs=True)
+            return None
 
-        path = m.group(1).strip()
-        m2 = re.match(r'^(svn\+ssh|http|https)://([-a-zA-Z0-9.]*@)(.*)$',
-                      path)
+        path = m.group(1)
+        m2 = re.match(r'^(svn\+ssh|http|https|svn)://([-a-zA-Z0-9.]*@)(.*)$',
+                        path)
         if m2:
             path = '%s://%s' % (m2.group(1), m2.group(3))
 
-        return RepositoryInfo(path=path, base_path='',
+        m = re.search(r'^URL: (.+)$', svn_info, re.M)
+
+        if not m:
+            return None
+
+        base_path = m.group(1)[len(path):] or "/"
+        return RepositoryInfo(path=path, base_path=base_path,
                               supports_parent_diffs=True)
+
+    @property
+    def hg_root(self):
+        if not self._hg_root:
+            root = execute(['hg', 'root'], env=self._hg_env,
+                           ignore_errors=True)
+
+            if not root.startswith('abort:'):
+                self._hg_root = root.strip()
+            else:
+                return None
+
+        return self._hg_root
+
+    def _load_hgrc(self):
+        for line in execute(['hg', 'showconfig'], split_lines=True):
+            key, value = line.split('=', 1)
+            self.hgrc[key] = value.strip()
 
     def extract_summary(self, revision):
         """
         Extracts the first line from the description of the given changeset.
         """
         return execute(['hg', 'log', '-r%s' % revision, '--template',
-                        r'{desc|firstline}\n'])
+                        r'{desc|firstline}\n'], env=self._hg_env)
 
     def extract_description(self, rev1, rev2):
         """
         Extracts all descriptions in the given revision range and concatenates
         them, most recent ones going first.
         """
-        numrevs = len(execute(['hg', 'log', '-r%s:%s' % (rev2, rev1),
-                               '--follow', '--template',
-                               r'{rev}\n']).strip().split('\n'))
+        numrevs = len(execute([
+            'hg', 'log', '-r%s:%s' % (rev2, rev1),
+            '--follow', '--template', r'{rev}\n'], env=self._hg_env
+        ).strip().split('\n'))
+
         return execute(['hg', 'log', '-r%s:%s' % (rev2, rev1),
                         '--follow', '--template',
                         r'{desc}\n\n', '--limit',
-                        str(numrevs - 1)]).strip()
+                        str(numrevs - 1)], env=self._hg_env).strip()
 
     def diff(self, files):
         """
         Performs a diff across all modified files in a Mercurial repository.
         """
-        # We don't support parent diffs with Mercurial yet, so we always
-        # return None for the parent diff.
-        if self.type == 'svn':
-            parent = execute(['hg', 'parent', '--svn', '--template',
-                              '{node}\n']).strip()
+        files = files or []
 
-            if options.parent_branch:
-                parent = options.parent_branch
+        if self._type == 'svn':
+            return self._get_hgsubversion_diff(files)
+        else:
+            return self._get_outgoing_diff(files)
 
-            if options.guess_summary and not options.summary:
-                options.summary = self.extract_summary(".")
+    def _get_hgsubversion_diff(self, files):
+        parent = execute(['hg', 'parent', '--svn', '--template',
+                          '{node}\n']).strip()
 
-            if options.guess_description and not options.description:
-                options.description = self.extract_description(parent, ".")
+        if options.parent_branch:
+            parent = options.parent_branch
 
-            return (execute(["hg", "diff", "--svn", '-r%s:.' % parent]), None)
+        if options.guess_summary and not options.summary:
+            options.summary = self.extract_summary(".")
 
-        return (execute(["hg", "diff"] + files), None)
+        if options.guess_description and not options.description:
+            options.description = self.extract_description(parent, ".")
+
+        return (execute(["hg", "diff", "--svn", '-r%s:.' % parent]), None)
+
+    def _get_outgoing_diff(self, files):
+        """
+        When working with a clone of a Mercurial remote, we need to find
+        out what the outgoing revisions are for a given branch.  It would
+        be nice if we could just do `hg outgoing --patch <remote>`, but
+        there are a couple of problems with this.
+
+        For one, the server-side diff parser isn't yet equipped to filter out
+        diff headers such as "comparing with..." and "changeset: <rev>:<hash>".
+        Another problem is that the output of `outgoing` potentially includes
+        changesets across multiple branches.
+
+        In order to provide the most accurate comparison between one's local
+        clone and a given remote -- something akin to git's diff command syntax
+        `git diff <treeish>..<treeish>` -- we have to do the following:
+
+            - get the name of the current branch
+            - get a list of outgoing changesets, specifying a custom format
+            - filter outgoing changesets by the current branch name
+            - get the "top" and "bottom" outgoing changesets
+            - use these changesets as arguments to `hg diff -r <rev> -r <rev>`
+
+
+        Future modifications may need to be made to account for odd cases like
+        having multiple diverged branches which share partial history -- or we
+        can just punish developers for doing such nonsense :)
+        """
+        files = files or []
+
+        remote = self._remote_path[0]
+
+        if not remote and options.parent_branch:
+            remote = options.parent_branch
+
+        current_branch = execute(['hg', 'branch'], env=self._hg_env).strip()
+
+        outgoing_changesets = \
+            self._get_outgoing_changesets(current_branch, remote)
+
+        top_rev, bottom_rev = \
+            self._get_top_and_bottom_outgoing_revs(outgoing_changesets)
+
+        if options.guess_summary and not options.summary:
+            options.summary = self.extract_summary(top_rev).rstrip("\n")
+
+        if options.guess_description and not options.description:
+            options.description = self.extract_description(bottom_rev, top_rev)
+
+        full_command = ['hg', 'diff', '-r', str(bottom_rev), '-r',
+                        str(top_rev)] + files
+
+        return (execute(full_command, env=self._hg_env), None)
+
+    def _get_outgoing_changesets(self, current_branch, remote):
+        """
+        Given the current branch name and a remote path, return a list
+        of outgoing changeset numbers.
+        """
+        outgoing_changesets = []
+        raw_outgoing = execute(['hg', '-q', 'outgoing', '--template',
+                                'b:{branches}\nr:{rev}\n\n', remote],
+                               env=self._hg_env)
+
+        for pair in raw_outgoing.split('\n\n'):
+            if not pair.strip():
+                continue
+
+            branch, rev = pair.strip().split('\n')
+
+            branch_name = branch[len('b:'):].strip()
+            branch_name = branch_name or 'default'
+            revno = rev[len('r:'):]
+
+            if branch_name == current_branch and revno.isdigit():
+                debug('Found outgoing changeset %s for branch %r'
+                      % (revno, branch_name))
+                outgoing_changesets.append(int(revno))
+
+        return outgoing_changesets
+
+    def _get_top_and_bottom_outgoing_revs(self, outgoing_changesets):
+        # This is a classmethod rather than a func mostly just to keep the
+        # module namespace clean.  Pylint told me to do it.
+        top_rev = max(outgoing_changesets)
+        bottom_rev = min(outgoing_changesets)
+
+        parents = execute(["hg", "log", "-r", str(bottom_rev),
+                           "--template", "{parents}"],
+                          env=self._hg_env)
+        parents = parents.rstrip("\n").split(":")
+
+        if len(parents) > 1:
+            bottom_rev = parents[0]
+        else:
+            bottom_rev = bottom_rev - 1
+
+        bottom_rev = max(0, bottom_rev)
+
+        return top_rev, bottom_rev
 
     def diff_between_revisions(self, revision_range, args, repository_info):
         """
         Performs a diff between 2 revisions of a Mercurial repository.
         """
-        if self.type != 'hg':
+        if self._type != 'hg':
             raise NotImplementedError
 
-        r1, r2 = revision_range.split(':')
+        if ':' in revision_range:
+            r1, r2 = revision_range.split(':')
+        else:
+            # If only 1 revision is given, we find the first parent and use
+            # that as the second revision.
+            #
+            # We could also use "hg diff -c r1", but then we couldn't reuse the
+            # code for extracting descriptions.
+            r2 = revision_range
+            r1 = execute(["hg", "parents", "-r", r2,
+                          "--template", "{rev}\n"]).split()[0]
 
         if options.guess_summary and not options.summary:
             options.summary = self.extract_summary(r2)
@@ -2039,7 +2695,27 @@ class MercurialClient(SCMClient):
         if options.guess_description and not options.description:
             options.description = self.extract_description(r1, r2)
 
-        return execute(["hg", "diff", "-r", r1, "-r", r2])
+        return (execute(["hg", "diff", "-r", r1, "-r", r2],
+                        env=self._hg_env), None)
+
+    def scan_for_server(self, repository_info):
+        # Scan first for dot files, since it's faster and will cover the
+        # user's $HOME/.reviewboardrc
+        server_url = \
+            super(MercurialClient, self).scan_for_server(repository_info)
+
+        if not server_url and self.hgrc.get('reviewboard.url'):
+            server_url = self.hgrc.get('reviewboard.url').strip()
+
+        if not server_url and self._type == "svn":
+            # Try using the reviewboard:url property on the SVN repo, if it
+            # exists.
+            prop = SVNClient().scan_for_server_property(repository_info)
+
+            if prop:
+                return prop
+
+        return server_url
 
 
 class GitClient(SCMClient):
@@ -2048,93 +2724,143 @@ class GitClient(SCMClient):
     compatible diffs. This will attempt to generate a diff suitable for the
     remote repository, whether git, SVN or Perforce.
     """
+    def __init__(self):
+        SCMClient.__init__(self)
+        # Store the 'correct' way to invoke git, just plain old 'git' by default
+        self.git = 'git'
+
+    def _strip_heads_prefix(self, ref):
+        """ Strips prefix from ref name, if possible """
+        return re.sub(r'^refs/heads/', '', ref)
+
     def get_repository_info(self):
         if not check_install('git --help'):
-            return None
+            # CreateProcess (launched via subprocess, used by check_install)
+            # does not automatically append .cmd for things it finds in PATH.
+            # If we're on Windows, and this works, save it for further use.
+            if sys.platform.startswith('win') and check_install('git.cmd --help'):
+                self.git = 'git.cmd'
+            else:
+                return None
 
-        git_dir = execute(["git", "rev-parse", "--git-dir"],
-                          ignore_errors=True).strip()
+        git_dir = execute([self.git, "rev-parse", "--git-dir"],
+                          ignore_errors=True).rstrip("\n")
 
         if git_dir.startswith("fatal:") or not os.path.isdir(git_dir):
             return None
+        self.bare = execute([self.git, "config", "core.bare"]).strip() == 'true'
 
         # post-review in directories other than the top level of
         # of a work-tree would result in broken diffs on the server
-        os.chdir(os.path.dirname(os.path.abspath(git_dir)))
+        if not self.bare:
+            os.chdir(os.path.dirname(os.path.abspath(git_dir)))
 
-        self.head_ref = execute(['git', 'symbolic-ref', '-q', 'HEAD']).strip()
+        self.head_ref = execute([self.git, 'symbolic-ref', '-q', 'HEAD']).strip()
 
         # We know we have something we can work with. Let's find out
-        # what it is. We'll try SVN first.
-        data = execute(["git", "svn", "info"], ignore_errors=True)
+        # what it is. We'll try SVN first, but only if there's a .git/svn
+        # directory. Otherwise, it may attempt to create one and scan
+        # revisions, which can be slow.
+        git_svn_dir = os.path.join(git_dir, 'svn')
 
-        m = re.search(r'^Repository Root: (.+)$', data, re.M)
-        if m:
-            path = m.group(1)
-            m = re.search(r'^URL: (.+)$', data, re.M)
+        if os.path.isdir(git_svn_dir) and len(os.listdir(git_svn_dir)) > 0:
+            data = execute([self.git, "svn", "info"], ignore_errors=True)
+
+            m = re.search(r'^Repository Root: (.+)$', data, re.M)
 
             if m:
-                base_path = m.group(1)[len(path):] or "/"
-                m = re.search(r'^Repository UUID: (.+)$', data, re.M)
+                path = m.group(1)
+                m = re.search(r'^URL: (.+)$', data, re.M)
 
                 if m:
-                    uuid = m.group(1)
-                    self.type = "svn"
-                    self.upstream_branch = options.parent_branch or 'master'
+                    base_path = m.group(1)[len(path):] or "/"
+                    m = re.search(r'^Repository UUID: (.+)$', data, re.M)
 
-                    return SvnRepositoryInfo(path=path, base_path=base_path,
-                                             uuid=uuid,
-                                             supports_parent_diffs=True)
-        else:
-            # Versions of git-svn before 1.5.4 don't (appear to) support
-            # 'git svn info'.  If we fail because of an older git install,
-            # here, figure out what version of git is installed and give
-            # the user a hint about what to do next.
-            version = execute(["git", "svn", "--version"], ignore_errors=True)
-            version_parts = re.search('version (\d+)\.(\d+)\.(\d+)',
-                                      version)
-            svn_remote = execute(["git", "config", "--get",
-                                  "svn-remote.svn.url"], ignore_errors=True)
+                    if m:
+                        uuid = m.group(1)
+                        self.type = "svn"
 
-            if (version_parts and
-                not self.is_valid_version((int(version_parts.group(1)),
-                                           int(version_parts.group(2)),
-                                           int(version_parts.group(3))),
-                                          (1, 5, 4)) and
-                svn_remote):
-                die("Your installation of git-svn must be upgraded to " + \
-                    "version 1.5.4 or later")
+                        # Get SVN tracking branch
+                        if options.parent_branch:
+                            self.upstream_branch = options.parent_branch
+                        else:
+                            data = execute([self.git, "svn", "rebase", "-n"],
+                                           ignore_errors=True)
+                            m = re.search(r'^Remote Branch:\s*(.+)$', data, re.M)
+
+                            if m:
+                                self.upstream_branch = m.group(1)
+                            else:
+                                sys.stderr.write('Failed to determine SVN tracking '
+                                                 'branch. Defaulting to "master"\n')
+                                self.upstream_branch = 'master'
+
+                        return SvnRepositoryInfo(path=path,
+                                                 base_path=base_path,
+                                                 uuid=uuid,
+                                                 supports_parent_diffs=True)
+            else:
+                # Versions of git-svn before 1.5.4 don't (appear to) support
+                # 'git svn info'.  If we fail because of an older git install,
+                # here, figure out what version of git is installed and give
+                # the user a hint about what to do next.
+                version = execute([self.git, "svn", "--version"],
+                                  ignore_errors=True)
+                version_parts = re.search('version (\d+)\.(\d+)\.(\d+)',
+                                          version)
+                svn_remote = execute([self.git, "config", "--get",
+                                      "svn-remote.svn.url"],
+                                      ignore_errors=True)
+
+                if (version_parts and
+                    not self.is_valid_version((int(version_parts.group(1)),
+                                               int(version_parts.group(2)),
+                                               int(version_parts.group(3))),
+                                              (1, 5, 4)) and
+                    svn_remote):
+                    die("Your installation of git-svn must be upgraded to "
+                        "version 1.5.4 or later")
 
         # Okay, maybe Perforce.
         # TODO
 
         # Nope, it's git then.
         # Check for a tracking branch and determine merge-base
-        short_head = self.head_ref.split('/')[-1]
-        merge = execute(['git', 'config', '--get',
+        short_head = self._strip_heads_prefix(self.head_ref)
+        merge = execute([self.git, 'config', '--get',
                          'branch.%s.merge' % short_head],
                         ignore_errors=True).strip()
-        remote = execute(['git', 'config', '--get',
+        remote = execute([self.git, 'config', '--get',
                           'branch.%s.remote' % short_head],
                          ignore_errors=True).strip()
 
-        HEADS_PREFIX = 'refs/heads/'
-
-        if merge.startswith(HEADS_PREFIX):
-            merge = merge[len(HEADS_PREFIX):]
-
+        merge = self._strip_heads_prefix(merge)
         self.upstream_branch = ''
 
         if remote and remote != '.' and merge:
             self.upstream_branch = '%s/%s' % (remote, merge)
 
-        self.upstream_branch, origin_url = self.get_origin(self.upstream_branch,
-                                                       True)
+        url = None
+        if options.repository_url:
+            url = options.repository_url
+        else:
+            self.upstream_branch, origin_url = \
+                self.get_origin(self.upstream_branch, True)
 
-        if not origin_url or origin_url.startswith("fatal:"):
-            self.upstream_branch, origin_url = self.get_origin()
+            if not origin_url or origin_url.startswith("fatal:"):
+                self.upstream_branch, origin_url = self.get_origin()
 
+            url = origin_url.rstrip('/')
+
+        # Central bare repositories don't have origin URLs.
+        # We return git_dir instead and hope for the best.
         url = origin_url.rstrip('/')
+
+        if not url:
+            url = os.path.abspath(git_dir)
+
+            # There is no remote, so skip this part of upstream_branch.
+            self.upstream_branch = self.upstream_branch.split('/')[-1]
         if url:
             self.type = "git"
             return RepositoryInfo(path=url, base_path='',
@@ -2150,10 +2876,10 @@ class GitClient(SCMClient):
         upstream_branch = options.tracking or default_upstream_branch or \
                           'origin/master'
         upstream_remote = upstream_branch.split('/')[0]
-        origin_url = execute(["git", "config", "remote.%s.url" % upstream_remote],
-                         ignore_errors=ignore_errors)
-
-        return (upstream_branch, origin_url.rstrip('\n'))
+        origin_url = execute([self.git, "config", "--get",
+                              "remote.%s.url" % upstream_remote],
+                              ignore_errors=True).rstrip("\n")
+        return (upstream_branch, origin_url)
 
     def is_valid_version(self, actual, expected):
         """
@@ -2176,7 +2902,7 @@ class GitClient(SCMClient):
             return server_url
 
         # TODO: Maybe support a server per remote later? Is that useful?
-        url = execute(["git", "config", "--get", "reviewboard.url"],
+        url = execute([self.git, "config", "--get", "reviewboard.url"],
                       ignore_errors=True).strip()
         if url:
             return url
@@ -2198,7 +2924,7 @@ class GitClient(SCMClient):
         """
         parent_branch = options.parent_branch
 
-        self.merge_base = execute(["git", "merge-base", self.upstream_branch,
+        self.merge_base = execute([self.git, "merge-base", self.upstream_branch,
                                    self.head_ref]).strip()
 
         if parent_branch:
@@ -2209,12 +2935,13 @@ class GitClient(SCMClient):
             parent_diff_lines = None
 
         if options.guess_summary and not options.summary:
-            options.summary = execute(["git", "log", "--pretty=format:%s",
-                                       "HEAD^.."], ignore_errors=True).strip()
+            s = execute([self.git, "log", "--pretty=format:%s", "HEAD^.."],
+                        ignore_errors=True)
+            options.summary = s.replace('\n', ' ').strip()
 
         if options.guess_description and not options.description:
             options.description = execute(
-                ["git", "log", "--pretty=format:%s%n%n%b",
+                [self.git, "log", "--pretty=format:%s%n%n%b",
                  (parent_branch or self.merge_base) + ".."],
                 ignore_errors=True).strip()
 
@@ -2224,16 +2951,19 @@ class GitClient(SCMClient):
         """
         Performs a diff on a particular branch range.
         """
-        rev_range = "%s..%s" % (ancestor, commit)
+        if commit:
+            rev_range = "%s..%s" % (ancestor, commit)
+        else:
+            rev_range = ancestor
 
         if self.type == "svn":
-            diff_lines = execute(["git", "diff", "--no-color", "--no-prefix",
-                                  "-r", "-u", rev_range],
+            diff_lines = execute([self.git, "diff", "--no-color", "--no-prefix",
+                                  "--no-ext-diff", "-r", "-u", rev_range],
                                  split_lines=True)
             return self.make_svn_diff(ancestor, diff_lines)
         elif self.type == "git":
-            return execute(["git", "diff", "--no-color", "--full-index",
-                            rev_range])
+            return execute([self.git, "diff", "--no-color", "--full-index",
+                            "--no-ext-diff", rev_range])
 
         return None
 
@@ -2243,14 +2973,13 @@ class GitClient(SCMClient):
         svn diff would generate. This is needed so the SVNTool in Review
         Board can properly parse this diff.
         """
-        rev = execute(["git", "svn", "find-rev", parent_branch]).strip()
+        rev = execute([self.git, "svn", "find-rev", parent_branch]).strip()
 
         if not rev:
             return None
 
         diff_data = ""
         filename = ""
-        revision = ""
         newfile = False
 
         for line in diff_lines:
@@ -2295,33 +3024,400 @@ class GitClient(SCMClient):
 
     def diff_between_revisions(self, revision_range, args, repository_info):
         """Perform a diff between two arbitrary revisions"""
+
+        # Make a parent diff to the first of the revisions so that we
+        # never end up with broken patches:
+        self.merge_base = execute([self.git, "merge-base", self.upstream_branch,
+                                   self.head_ref]).strip()
+
         if ":" not in revision_range:
             # only one revision is specified
+
+            # Check if parent contains the first revision and make a
+            # parent diff if not:
+            pdiff_required = execute([self.git, "branch", "-r",
+                                      "--contains", revision_range])
+            parent_diff_lines = None
+
+            if not pdiff_required:
+                parent_diff_lines = self.make_diff(self.merge_base, revision_range)
+
             if options.guess_summary and not options.summary:
-                options.summary = execute(
-                    ["git", "log", "--pretty=format:%s", revision_range + ".."],
-                    ignore_errors=True).strip()
+                s = execute([self.git, "log", "--pretty=format:%s",
+                             revision_range + ".."],
+                            ignore_errors=True)
+                options.summary = s.replace('\n', ' ').strip()
 
             if options.guess_description and not options.description:
                 options.description = execute(
-                    ["git", "log", "--pretty=format:%s%n%n%b", revision_range + ".."],
+                    [self.git, "log", "--pretty=format:%s%n%n%b", revision_range + ".."],
                     ignore_errors=True).strip()
 
-            return self.make_diff(revision_range)
+            return (self.make_diff(revision_range), parent_diff_lines)
         else:
             r1, r2 = revision_range.split(":")
+            # Check if parent contains the first revision and make a
+            # parent diff if not:
+            pdiff_required = execute([self.git, "branch", "-r",
+                                      "--contains", r1])
+            parent_diff_lines = None
+
+            if not pdiff_required:
+                parent_diff_lines = self.make_diff(self.merge_base, r1)
 
             if options.guess_summary and not options.summary:
-                options.summary = execute(
-                    ["git", "log", "--pretty=format:%s", "%s..%s" % (r1, r2)],
-                    ignore_errors=True).strip()
+                s = execute([self.git, "log", "--pretty=format:%s",
+                             "%s..%s" % (r1, r2)],
+                            ignore_errors=True)
+                options.summary = s.replace('\n', ' ').strip()
 
             if options.guess_description and not options.description:
                 options.description = execute(
-                    ["git", "log", "--pretty=format:%s%n%n%b", "%s..%s" % (r1, r2)],
+                    [self.git, "log", "--pretty=format:%s%n%n%b", "%s..%s" % (r1, r2)],
                     ignore_errors=True).strip()
 
-            return self.make_diff(r1, r2)
+            return (self.make_diff(r1, r2), parent_diff_lines)
+
+
+class PlasticClient(SCMClient):
+    """
+    A wrapper around the cm Plastic tool that fetches repository
+    information and generates compatible diffs
+    """
+    def get_repository_info(self):
+        if not check_install('cm version'):
+            return None
+
+        # Get the repository that the current directory is from.  If there
+        # is more than one repository mounted in the current directory,
+        # bail out for now (in future, should probably enter a review
+        # request per each repository.)
+        split = execute(["cm", "ls", "--format={8}"], split_lines=True,
+                        ignore_errors=True)
+        m = re.search(r'^rep:(.+)$', split[0], re.M)
+
+        if not m:
+            return None
+
+        # Make sure the repository list contains only one unique entry
+        if len(split) != split.count(split[0]):
+            # Not unique!
+            die('Directory contains more than one mounted repository')
+
+        path = m.group(1)
+
+        # Get the workspace directory, so we can strip it from the diff output
+        self.workspacedir = execute(["cm", "gwp", ".", "--format={1}"],
+                                    split_lines=False,
+                                    ignore_errors=True).strip()
+
+        debug("Workspace is %s" % self.workspacedir)
+
+        return RepositoryInfo(path,
+                              supports_changesets=True,
+                              supports_parent_diffs=False)
+
+    def get_changenum(self, args):
+        """ Extract the integer value from a changeset ID (cs:1234) """
+        if len(args) == 1 and args[0].startswith("cs:"):
+                try:
+                    return str(int(args[0][3:]))
+                except ValueError:
+                    pass
+
+        return None
+
+    def sanitize_changenum(self, changenum):
+        """ Return a "sanitized" change number.  Currently a no-op """
+        return changenum
+
+    def diff(self, args):
+        """
+        Performs a diff across all modified files in a Plastic workspace
+
+        Parent diffs are not supported (the second value in the tuple).
+        """
+        changenum = self.get_changenum(args)
+
+        if changenum is None:
+            return self.branch_diff(args), None
+        else:
+            return self.changenum_diff(changenum), None
+
+    def diff_between_revisions(self, revision_range, args, repository_info):
+        """
+        Performs a diff between 2 revisions of a Plastic repository.
+
+        Assume revision_range is a branch specification (br:/main/task001)
+        and hand over to branch_diff
+        """
+        return (self.branch_diff(revision_range), None)
+
+    def changenum_diff(self, changenum):
+        debug("changenum_diff: %s" % (changenum))
+        files = execute(["cm", "log", "cs:" + changenum,
+                         "--csFormat={items}",
+                         "--itemFormat={shortstatus} {path} "
+                         "rev:revid:{revid} rev:revid:{parentrevid} "
+                         "src:{srccmpath} rev:revid:{srcdirrevid} "
+                         "dst:{dstcmpath} rev:revid:{dstdirrevid}{newline}"],
+                        split_lines = True)
+
+        debug("got files: %s" % (files))
+
+        # Diff generation based on perforce client
+        diff_lines = []
+
+        empty_filename = make_tempfile()
+        tmp_diff_from_filename = make_tempfile()
+        tmp_diff_to_filename = make_tempfile()
+
+        for f in files:
+            f = f.strip()
+
+            if not f:
+                continue
+
+            m = re.search(r'(?P<type>[ACIMR]) (?P<file>.*) '
+                          r'(?P<revspec>rev:revid:[-\d]+) '
+                          r'(?P<parentrevspec>rev:revid:[-\d]+) '
+                          r'src:(?P<srcpath>.*) '
+                          r'(?P<srcrevspec>rev:revid:[-\d]+) '
+                          r'dst:(?P<dstpath>.*) '
+                          r'(?P<dstrevspec>rev:revid:[-\d]+)$',
+                          f)
+            if not m:
+                die("Could not parse 'cm log' response: %s" % f)
+
+            changetype = m.group("type")
+            filename = m.group("file")
+
+            if changetype == "M":
+                # Handle moved files as a delete followed by an add.
+                # Clunky, but at least it works
+                oldfilename = m.group("srcpath")
+                oldspec = m.group("srcrevspec")
+                newfilename = m.group("dstpath")
+                newspec = m.group("dstrevspec")
+
+                self.write_file(oldfilename, oldspec, tmp_diff_from_filename)
+                dl = self.diff_files(tmp_diff_from_filename, empty_filename,
+                                     oldfilename, "rev:revid:-1", oldspec,
+                                     changetype)
+                diff_lines += dl
+
+                self.write_file(newfilename, newspec, tmp_diff_to_filename)
+                dl = self.diff_files(empty_filename, tmp_diff_to_filename,
+                                     newfilename, newspec, "rev:revid:-1",
+                                     changetype)
+                diff_lines += dl
+            else:
+                newrevspec = m.group("revspec")
+                parentrevspec = m.group("parentrevspec")
+
+                debug("Type %s File %s Old %s New %s" % (changetype,
+                                                         filename,
+                                                         parentrevspec,
+                                                         newrevspec))
+
+                old_file = new_file = empty_filename
+
+                if (changetype in ['A'] or
+                    (changetype in ['C', 'I'] and
+                     parentrevspec == "rev:revid:-1")):
+                    # File was Added, or a Change or Merge (type I) and there
+                    # is no parent revision
+                    self.write_file(filename, newrevspec, tmp_diff_to_filename)
+                    new_file = tmp_diff_to_filename
+                elif changetype in ['C', 'I']:
+                    # File was Changed or Merged (type I)
+                    self.write_file(filename, parentrevspec,
+                                    tmp_diff_from_filename)
+                    old_file = tmp_diff_from_filename
+                    self.write_file(filename, newrevspec, tmp_diff_to_filename)
+                    new_file = tmp_diff_to_filename
+                elif changetype in ['R']:
+                    # File was Removed
+                    self.write_file(filename, parentrevspec,
+                                    tmp_diff_from_filename)
+                    old_file = tmp_diff_from_filename
+                else:
+                    die("Don't know how to handle change type '%s' for %s" %
+                        (changetype, filename))
+
+                dl = self.diff_files(old_file, new_file, filename,
+                                     newrevspec, parentrevspec, changetype)
+                diff_lines += dl
+
+        os.unlink(empty_filename)
+        os.unlink(tmp_diff_from_filename)
+        os.unlink(tmp_diff_to_filename)
+
+        return ''.join(diff_lines)
+
+    def branch_diff(self, args):
+        debug("branch diff: %s" % (args))
+
+        if len(args) > 0:
+            branch = args[0]
+        else:
+            branch = args
+
+        if not branch.startswith("br:"):
+            return None
+
+        if not options.branch:
+            options.branch = branch
+
+        files = execute(["cm", "fbc", branch, "--format={3} {4}"],
+                        split_lines = True)
+        debug("got files: %s" % (files))
+
+        diff_lines = []
+
+        empty_filename = make_tempfile()
+        tmp_diff_from_filename = make_tempfile()
+        tmp_diff_to_filename = make_tempfile()
+
+        for f in files:
+            f = f.strip()
+
+            if not f:
+                continue
+
+            m = re.search(r'^(?P<branch>.*)#(?P<revno>\d+) (?P<file>.*)$', f)
+
+            if not m:
+                die("Could not parse 'cm fbc' response: %s" % f)
+
+            filename = m.group("file")
+            branch = m.group("branch")
+            revno = m.group("revno")
+
+            # Get the base revision with a cm find
+            basefiles = execute(["cm", "find", "revs", "where",
+                                 "item='" + filename + "'", "and",
+                                 "branch='" + branch + "'", "and",
+                                 "revno=" + revno,
+                                 "--format={item} rev:revid:{id} "
+                                 "rev:revid:{parent}", "--nototal"],
+                                split_lines = True)
+
+            # We only care about the first line
+            m = re.search(r'^(?P<filename>.*) '
+                              r'(?P<revspec>rev:revid:[-\d]+) '
+                              r'(?P<parentrevspec>rev:revid:[-\d]+)$',
+                              basefiles[0])
+            basefilename = m.group("filename")
+            newrevspec = m.group("revspec")
+            parentrevspec = m.group("parentrevspec")
+
+            # Cope with adds/removes
+            changetype = "C"
+
+            if parentrevspec == "rev:revid:-1":
+                changetype = "A"
+            elif newrevspec == "rev:revid:-1":
+                changetype = "R"
+
+            debug("Type %s File %s Old %s New %s" % (changetype,
+                                                     basefilename,
+                                                     parentrevspec,
+                                                     newrevspec))
+
+            old_file = new_file = empty_filename
+
+            if changetype == "A":
+                # File Added
+                self.write_file(basefilename, newrevspec,
+                                tmp_diff_to_filename)
+                new_file = tmp_diff_to_filename
+            elif changetype == "R":
+                # File Removed
+                self.write_file(basefilename, parentrevspec,
+                                tmp_diff_from_filename)
+                old_file = tmp_diff_from_filename
+            else:
+                self.write_file(basefilename, parentrevspec,
+                                tmp_diff_from_filename)
+                old_file = tmp_diff_from_filename
+
+                self.write_file(basefilename, newrevspec,
+                                tmp_diff_to_filename)
+                new_file = tmp_diff_to_filename
+
+            dl = self.diff_files(old_file, new_file, basefilename,
+                                 newrevspec, parentrevspec, changetype)
+            diff_lines += dl
+
+        os.unlink(empty_filename)
+        os.unlink(tmp_diff_from_filename)
+        os.unlink(tmp_diff_to_filename)
+
+        return ''.join(diff_lines)
+
+    def diff_files(self, old_file, new_file, filename, newrevspec,
+                   parentrevspec, changetype, ignore_unmodified=False):
+        """
+        Do the work of producing a diff for Plastic (based on the Perforce one)
+
+        old_file - The absolute path to the "old" file.
+        new_file - The absolute path to the "new" file.
+        filename - The file in the Plastic workspace
+        newrevspec - The revid spec of the changed file
+        parentrevspecspec - The revision spec of the "old" file
+        changetype - The change type as a single character string
+        ignore_unmodified - If true, will return an empty list if the file
+            is not changed.
+
+        Returns a list of strings of diff lines.
+        """
+        if filename.startswith(self.workspacedir):
+            filename = filename[len(self.workspacedir):]
+
+        diff_cmd = ["diff", "-urN", old_file, new_file]
+        # Diff returns "1" if differences were found.
+        dl = execute(diff_cmd, extra_ignore_errors=(1,2),
+                     translate_newlines = False)
+
+        # If the input file has ^M characters at end of line, lets ignore them.
+        dl = dl.replace('\r\r\n', '\r\n')
+        dl = dl.splitlines(True)
+
+        # Special handling for the output of the diff tool on binary files:
+        #     diff outputs "Files a and b differ"
+        # and the code below expects the output to start with
+        #     "Binary files "
+        if (len(dl) == 1 and
+            dl[0].startswith('Files %s and %s differ' % (old_file, new_file))):
+            dl = ['Binary files %s and %s differ\n' % (old_file, new_file)]
+
+        if dl == [] or dl[0].startswith("Binary files "):
+            if dl == []:
+                if ignore_unmodified:
+                    return []
+                else:
+                    print "Warning: %s in your changeset is unmodified" % \
+                          filename
+
+            dl.insert(0, "==== %s (%s) ==%s==\n" % (filename, newrevspec,
+                                                    changetype))
+            dl.append('\n')
+        else:
+            dl[0] = "--- %s\t%s\n" % (filename, parentrevspec)
+            dl[1] = "+++ %s\t%s\n" % (filename, newrevspec)
+
+            # Not everybody has files that end in a newline.  This ensures
+            # that the resulting diff file isn't broken.
+            if dl[-1][-1] != '\n':
+                dl.append('\n')
+
+        return dl
+
+    def write_file(self, filename, filespec, tmpfile):
+        """ Grabs a file from Plastic and writes it to a temp file """
+        debug("Writing '%s' (rev %s) to '%s'" % (filename, filespec, tmpfile))
+        execute(["cm", "cat", filespec, "--file=" + tmpfile])
 
 
 SCMCLIENTS = (
@@ -2331,6 +3427,7 @@ SCMCLIENTS = (
     MercurialClient(),
     PerforceClient(),
     ClearCaseClient(),
+    PlasticClient(),
 )
 
 def debug(s):
@@ -2341,12 +3438,14 @@ def debug(s):
         print ">>> %s" % s
 
 
-def make_tempfile():
+def make_tempfile(content=None):
     """
     Creates a temporary file and returns the path. The path is stored
     in an array for later cleanup.
     """
     fd, tmpfile = mkstemp()
+    if content:
+        os.write(fd, content)
     os.close(fd)
     tempfiles.append(tmpfile)
     return tmpfile
@@ -2360,10 +3459,10 @@ def check_install(command):
     instance, 'svn help' or 'git --version').
     """
     try:
-        p = subprocess.Popen(command.split(' '),
-                             stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE)
+        subprocess.Popen(command.split(' '),
+                         stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE)
         return True
     except OSError:
         return False
@@ -2395,7 +3494,7 @@ def check_gnu_diff():
 
 
 def execute(command, env=None, split_lines=False, ignore_errors=False,
-            extra_ignore_errors=(), translate_newlines=True):
+            extra_ignore_errors=(), translate_newlines=True, with_errors=True):
     """
     Utility function to execute a command and return the output.
     """
@@ -2412,11 +3511,16 @@ def execute(command, env=None, split_lines=False, ignore_errors=False,
     env['LC_ALL'] = 'en_US.UTF-8'
     env['LANGUAGE'] = 'en_US.UTF-8'
 
+    if with_errors:
+        errors_output = subprocess.STDOUT
+    else:
+        errors_output = subprocess.PIPE
+
     if sys.platform.startswith('win'):
         p = subprocess.Popen(command,
                              stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT,
+                             stderr=errors_output,
                              shell=False,
                              universal_newlines=translate_newlines,
                              env=env)
@@ -2424,7 +3528,7 @@ def execute(command, env=None, split_lines=False, ignore_errors=False,
         p = subprocess.Popen(command,
                              stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT,
+                             stderr=errors_output,
                              shell=False,
                              close_fds=True,
                              universal_newlines=translate_newlines,
@@ -2466,22 +3570,33 @@ def walk_parents(path):
         path = os.path.dirname(path)
 
 
-def load_config_file(filename):
-    """
-    Loads data from a config file.
-    """
-    config = {
-        'TREES': {},
-    }
+def load_config_files(homepath):
+    """Loads data from .reviewboardrc files"""
+    def _load_config(path):
+        config = {
+            'TREES': {},
+        }
 
-    if os.path.exists(filename):
-        try:
-            execfile(filename, config)
-        except SyntaxError, e:
-            die('Syntax error in config file: %s\n'
-                'Line %i offset %i\n' % (filename, e.lineno, e.offset))
+        filename = os.path.join(path, '.reviewboardrc')
 
-    return config
+        if os.path.exists(filename):
+            try:
+                execfile(filename, config)
+            except SyntaxError, e:
+                die('Syntax error in config file: %s\n'
+                    'Line %i offset %i\n' % (filename, e.lineno, e.offset))
+
+            return config
+
+        return None
+
+    for path in walk_parents(os.getcwd()):
+        config = _load_config(path)
+
+        if config:
+            configs.append(config)
+
+    globals()['user_config'] = _load_config(homepath)
 
 
 def tempt_fate(server, tool, changenum, diff_content=None,
@@ -2527,6 +3642,10 @@ def tempt_fate(server, tool, changenum, diff_content=None,
         if options.testing_done:
             server.set_review_request_field(review_request, 'testing_done',
                                             options.testing_done)
+
+        if options.change_description:
+            server.set_review_request_field(review_request, 'changedescription',
+                                            options.change_description)
     except APIError, e:
         if e.error_code == 103: # Not logged in
             retries = retries - 1
@@ -2569,10 +3688,13 @@ def tempt_fate(server, tool, changenum, diff_content=None,
             die("Your review request still exists, but the diff is not " +
                 "attached.")
 
+    if options.reopen:
+        server.reopen(review_request)
+
     if options.publish:
         server.publish(review_request)
 
-    request_url = 'r/' + str(review_request['id'])
+    request_url = 'r/' + str(review_request['id']) + '/'
     review_url = urljoin(server.url, request_url)
 
     if not review_url.startswith('http'):
@@ -2614,6 +3736,10 @@ def parse_options(args):
                       dest="diff_only", action="store_true", default=False,
                       help="uploads a new diff, but does not update "
                            "info from changelist")
+    parser.add_option("--reopen",
+                      dest="reopen", action="store_true", default=False,
+                      help="reopen discarded review request "
+                           "after update")
     parser.add_option("--target-groups",
                       dest="target_groups", default=TARGET_GROUPS,
                       help="names of the groups who will perform "
@@ -2635,12 +3761,12 @@ def parse_options(args):
                       dest="guess_summary", action="store_true",
                       default=False,
                       help="guess summary from the latest commit (git/"
-                           "hgsubversion only)")
+                           "hg/hgsubversion only)")
     parser.add_option("--guess-description",
                       dest="guess_description", action="store_true",
                       default=False,
                       help="guess description based on commits on this branch "
-                           "(git/hgsubversion only)")
+                           "(git/hg/hgsubversion only)")
     parser.add_option("--testing-done",
                       dest="testing_done", default=None,
                       help="details of testing done ")
@@ -2653,13 +3779,13 @@ def parse_options(args):
     parser.add_option("--bugs-closed",
                       dest="bugs_closed", default=None,
                       help="list of bugs closed ")
+    parser.add_option("--change-description", default=None,
+                      help="description of what changed in this revision of "
+                      "the review request when updating an existing request")
     parser.add_option("--revision-range",
                       dest="revision_range", default=None,
                       help="generate the diff for review based on given "
                            "revision range")
-    parser.add_option("--label",
-                      dest="label", default=None,
-                      help="label (ClearCase Only) ")
     parser.add_option("--submit-as",
                       dest="submit_as", default=SUBMIT_AS, metavar="USERNAME",
                       help="user name to be recorded as the author of the "
@@ -2693,12 +3819,21 @@ def parse_options(args):
     parser.add_option("--p4-port",
                       dest="p4_port", default=None,
                       help="the Perforce servers IP address that the review is on")
+    parser.add_option("--p4-passwd",
+                      dest="p4_passwd", default=None,
+                      help="the Perforce password or ticket of the user in the P4USER environment variable")
+    parser.add_option('--svn-changelist', dest='svn_changelist', default=None,
+                      help='generate the diff for review based on a local SVN '
+                           'changelist')
     parser.add_option("--repository-url",
                       dest="repository_url", default=None,
                       help="the url for a repository for creating a diff "
-                           "outside of a working copy (currently only supported "
-                           "by Subversion). Requires either --revision-range"
-                           "or --diff-filename options")
+                           "outside of a working copy (currently only "
+                           "supported by Subversion with --revision-range or "
+                           "--diff-filename and ClearCase with relative "
+                           "paths outside the view). For git, this specifies"
+                           "the origin url of the current repository, "
+                           "overriding the origin url supplied by the git client.")
     parser.add_option("-d", "--debug",
                       action="store_true", dest="debug", default=DEBUG,
                       help="display debug output")
@@ -2706,6 +3841,12 @@ def parse_options(args):
                       dest="diff_filename", default=None,
                       help='upload an existing diff file, instead of '
                            'generating a new diff')
+    parser.add_option('--http-username',
+                      dest='http_username', default=None, metavar='USERNAME',
+                      help='username for HTTP Basic authentication')
+    parser.add_option('--http-password',
+                      dest='http_password', default=None, metavar='PASSWORD',
+                      help='password for HTTP Basic authentication')
 
     (globals()["options"], args) = parser.parse_args(args)
 
@@ -2739,12 +3880,14 @@ def parse_options(args):
                              options.testing_file)
             sys.exit(1)
 
-    if (options.repository_url and
-        not options.revision_range and
-        not options.diff_filename):
-        sys.stderr.write("The --repository-url option requires either the "
-                         "--revision-range option or the --diff-filename "
-                         "option.\n")
+    if options.reopen and not options.rid:
+        sys.stderr.write("The --reopen option requires "
+                         "--review-request-id option.\n")
+        sys.exit(1)
+
+    if options.change_description and not options.rid:
+        sys.stderr.write("--change-description may only be used "
+                         "when updating an existing review-request\n")
         sys.exit(1)
 
     return args
@@ -2800,13 +3943,18 @@ def main():
         homepath = ''
 
     # Load the config and cookie files
-    globals()['user_config'] = \
-        load_config_file(os.path.join(homepath, ".reviewboardrc"))
     cookie_file = os.path.join(homepath, ".post-review-cookies.txt")
+    load_config_files(homepath)
 
     args = parse_options(sys.argv[1:])
 
+    debug('RBTools %s' % get_version_string())
+    debug('Home = %s' % homepath)
+
     repository_info, tool = determine_client()
+
+    # Verify that options specific to an SCM Client have not been mis-used.
+    tool.check_options()
 
     # Try to find a valid Review Board server to use.
     if options.server:
@@ -2820,17 +3968,20 @@ def main():
 
     server = ReviewBoardServer(server_url, repository_info, cookie_file)
 
+    # Handle the case where /api/ requires authorization (RBCommons).
+    if not server.check_api_version():
+        die("Unable to log in with the supplied username and password.")
+
     if repository_info.supports_changesets:
         changenum = tool.get_changenum(args)
     else:
         changenum = None
 
     if options.revision_range:
-        diff = tool.diff_between_revisions(options.revision_range, args,
-                                           repository_info)
-        parent_diff = None
-    elif options.label and isinstance(tool, ClearCaseClient):
-        diff, parent_diff = tool.diff_label(options.label)
+        diff, parent_diff = tool.diff_between_revisions(options.revision_range, args,
+                                                        repository_info)
+    elif options.svn_changelist:
+        diff, parent_diff = tool.diff_changelist(options.svn_changelist)
     elif options.diff_filename:
         parent_diff = None
 
@@ -2846,11 +3997,24 @@ def main():
     else:
         diff, parent_diff = tool.diff(args)
 
-    if isinstance(tool, PerforceClient) and changenum is not None:
+    if len(diff) == 0:
+        die("There don't seem to be any diffs!")
+
+    if (isinstance(tool, PerforceClient) or
+        isinstance(tool, PlasticClient)) and changenum is not None:
         changenum = tool.sanitize_changenum(changenum)
 
+        # NOTE: In Review Board 1.5.2 through 1.5.3.1, the changenum support
+        #       is broken, so we have to force the deprecated API.
+        if (parse_version(server.rb_version) >= parse_version('1.5.2') and
+            parse_version(server.rb_version) <= parse_version('1.5.3.1')):
+            debug('Using changenums on Review Board %s, which is broken. '
+                  'Falling back to the deprecated 1.0 API' % server.rb_version)
+            server.deprecated_api = True
+
     if options.output_diff_only:
-        print diff
+        # The comma here isn't a typo, but rather suppresses the extra newline
+        print diff,
         sys.exit(0)
 
     # Let's begin.
